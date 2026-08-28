@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-autowired"
+version = "0.2.0"
+description = "Runtime dependency injection through self.x_instance = None"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Ayhan Öztemel" }]
+license = "MIT"
+keywords = ["dependency-injection", "autowiring", "fastapi", "flask", "django"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/AyhanOztemel/py-autowired"
+Repository = "https://github.com/AyhanOztemel/py-autowired"
+Documentation = "https://github.com/AyhanOztemel/py-autowired#readme"
+Issues = "https://github.com/AyhanOztemel/py-autowired/issues"
+
+[project.optional-dependencies]
+dev = ["build>=1.2", "pytest>=8", "twine>=6"]
+examples = ["django>=5.1", "fastapi>=0.115", "flask>=3.1", "uvicorn>=0.30"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["py_autowired*"]
+namespaces = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+addopts = "-ra"

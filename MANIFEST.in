@@ -1,0 +1,6 @@
+include README.md
+include CHANGELOG.md
+include KULLANIM_KILAVUZU_TR.md
+include USAGE_GUIDE_EN.md
+recursive-include examples *.py *.md *.txt
+recursive-include tests *.py

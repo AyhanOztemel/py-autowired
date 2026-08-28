@@ -1,0 +1,4 @@
+fastapi>=0.115
+flask>=3.1
+django>=5.1
+uvicorn>=0.30
