@@ -33,7 +33,13 @@ Issues = "https://github.com/AyhanOztemel/py-autowired/issues"
 
 [project.optional-dependencies]
 dev = ["build>=1.2", "pytest>=8", "twine>=6"]
-examples = ["django>=5.1", "fastapi>=0.115", "flask>=3.1", "uvicorn>=0.30"]
+examples = [
+  "django>=5.1",
+  "fastapi>=0.115",
+  "flask>=3.1",
+  "httpx2>=2.0",
+  "uvicorn>=0.30",
+]
 
 [tool.setuptools]
 package-dir = { "" = "src" }
