@@ -49,6 +49,9 @@ where = ["src"]
 include = ["py_autowired*"]
 namespaces = true
 
+[tool.setuptools.package-data]
+py_autowired = ["py.typed"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "."]

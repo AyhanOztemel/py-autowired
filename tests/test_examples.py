@@ -28,9 +28,20 @@ def _run(arguments):
     )
 
 
-def test_runtime_package_has_only_two_python_files():
-    files = sorted(path.name for path in (ROOT / "src" / "py_autowired").glob("*.py"))
-    assert files == ["autowired.py", "container.py"]
+def test_runtime_package_stays_minimal():
+    package = ROOT / "src" / "py_autowired"
+    files = sorted(path.name for path in package.glob("*.py"))
+    assert files == ["__init__.py", "autowired.py", "container.py"]
+    assert (package / "py.typed").is_file()
+
+
+def test_public_api_is_importable_from_the_package_root():
+    import py_autowired
+    from py_autowired import Container
+    from py_autowired.container import Container as SubmoduleContainer
+
+    assert Container is SubmoduleContainer
+    assert not [name for name in py_autowired.__all__ if not hasattr(py_autowired, name)]
 
 
 def test_console_direct_source_run_needs_no_pythonpath_src():
