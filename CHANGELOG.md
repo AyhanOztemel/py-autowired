@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 - 2026-08-30
+
+- Added `Container.register_alias()` with shared lifetime and instance semantics.
+- Made name-based injection aware of public alias binding names.
+- Added the optional `auto_inject(..., exclude_dirs=...)` extension point.
+- Preserved the existing discovery exclusions when `exclude_dirs` is omitted.
+
+
 ## 0.2.1 - 2026-08-28
 
 - Added canonical GitHub project metadata and the full author name.

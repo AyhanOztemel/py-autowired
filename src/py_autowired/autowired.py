@@ -15,7 +15,7 @@ from functools import wraps
 from pathlib import Path
 from collections import defaultdict
 from functools import lru_cache
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, Iterable, List, Optional, Any, Tuple
 
 # ============================================================================
 # CONFIGURATION
@@ -153,8 +153,10 @@ def _build_name_map_from_container(container):
     """
     name_map = defaultdict(list)
 
-    for reg in container.registrations.values():
-        st = reg.service_type
+    for binding_type, reg in container.registrations.items():
+        # Aliases share a registration with their target. Index the public
+        # binding name so name-based injection can resolve either contract.
+        st = binding_type
         it = reg.implementation_type or st
 
         # Interface name
@@ -331,8 +333,17 @@ def _patch_setattr(cls, container, name_map):
         return
 
     orig_setattr = getattr(cls, "__setattr__", object.__setattr__)
+    compat_aliases = dict(cls.__dict__.get("__di_compat_aliases__", {}))
+
 
     def __setattr__(self, name, value):
+        marker_name = compat_aliases.get(name)
+        if marker_name is not None:
+            # Keep old field names synchronized with the canonical *_instance
+            # marker without changing the natural auto-injection path.
+            setattr(self, marker_name, value)
+            value = getattr(self, marker_name)
+            return orig_setattr(self, name, value)
         if value is None and _DEF_ATTR_RE.match(name):
             base = name[:-len("_instance")]
             normalized_base = _norm(base)
@@ -516,11 +527,21 @@ def _import_module_safely(dotted_name: str, file_path: str) -> bool:
         return False
 
 
-def _discover_and_load_modules(root: Path) -> int:
+def _normalize_excluded_dirs(exclude_dirs: Optional[Iterable[str]]) -> frozenset[str]:
+    if exclude_dirs is None:
+        return frozenset(_EXCLUDED_DIRS)
+    if isinstance(exclude_dirs, (str, bytes)):
+        raise TypeError("exclude_dirs must be an iterable of directory names")
+    return frozenset(_EXCLUDED_DIRS).union(str(item) for item in exclude_dirs)
+
+
+def _discover_and_load_modules(root: Path, exclude_dirs: Optional[Iterable[str]] = None) -> int:
     """
     🔧 FIXED: Discover and load all modules recursively.
     Now correctly handles nested directory structures.
     """
+    excluded_dirs = _normalize_excluded_dirs(exclude_dirs)
+
     if DEBUG_MODE:
         print("\n📂 Modül keşfi başlatılıyor...")
         print(f"   Kök dizin: {root}")
@@ -540,7 +561,7 @@ def _discover_and_load_modules(root: Path) -> int:
     for p in py_files:
         # 🆕 v2: Dışlanan dizinler (.venv, site-packages, __pycache__ vb.) —
         #        sanal ortamın binlerce dosyasının import edilmesini engeller.
-        if _EXCLUDED_DIRS.intersection(p.parts):
+        if excluded_dirs.intersection(p.parts):
             continue
 
         # Skip conditions
@@ -607,7 +628,12 @@ def _serialized_class_patching(func):
 
 
 @_serialized_class_patching
-def auto_inject(container, root_dir: str | None = None):
+def auto_inject(
+    container,
+    root_dir: str | None = None,
+    *,
+    exclude_dirs: Optional[Iterable[str]] = None,
+):
     """
     🔧 FIXED VERSION - Now correctly handles nested structures!
 
@@ -618,6 +644,8 @@ def auto_inject(container, root_dir: str | None = None):
         container: DI container with service registrations
         root_dir: Optional custom root directory (if None, auto-detects project root)
 
+        exclude_dirs: Additional directory names that discovery must skip.
+            Built-in safety exclusions remain active.
     Returns:
         Number of patched classes
     """
@@ -639,7 +667,10 @@ def auto_inject(container, root_dir: str | None = None):
         print(f"📍 sys.path[0]: {sys.path[0]}")
 
     # Load modules
-    loaded_count = _discover_and_load_modules(root)
+    if exclude_dirs is None:
+        loaded_count = _discover_and_load_modules(root)
+    else:
+        loaded_count = _discover_and_load_modules(root, exclude_dirs)
 
     if loaded_count == 0 and DEBUG_MODE:
         print("\n⚠️ UYARI: Hiç modül yüklenemedi!")
