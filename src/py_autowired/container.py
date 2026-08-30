@@ -372,6 +372,26 @@ class Container:
             )
         )
 
+    def register_alias(self, alias_type: Type[Any], target_type: Type[Any]) -> None:
+        """Expose an existing registration under another service key.
+
+        The alias and target share the exact registration, lifetime, scope state,
+        and singleton instance.
+        """
+
+        with self._registration_lock:
+            registration = self.registrations.get(target_type)
+            if registration is None:
+                raise ServiceNotRegisteredError(
+                    f"Alias target is not registered: {target_type.__name__}"
+                )
+            if alias_type in self.registrations and self.strict_registrations:
+                raise DuplicateServiceRegistrationError(
+                    f"Service is already registered: {alias_type.__name__}"
+                )
+            self.registrations[alias_type] = registration
+            self.registration_history.append(("alias", alias_type))
+
     def register_factory(
         self,
         service_type: Type[Any],
