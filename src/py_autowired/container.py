@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextvars
 from dataclasses import dataclass, field
 from enum import Enum
-from functools import wraps
+from functools import lru_cache, wraps
 import inspect
 import threading
 from types import TracebackType
@@ -48,7 +48,7 @@ class CircularDependencyError(DependencyInjectionError):
     """Raised when dependency resolution contains a cycle."""
 
 
-class ResolutionError(ValueError, DependencyInjectionError):
+class ResolutionError(DependencyInjectionError):
     """Raised when a service cannot be constructed."""
 
 
@@ -84,29 +84,7 @@ def factory_dependencies(*service_types: Type[Any]):
     return decorate
 
 
-def _is_abstract_strict(service_type: Type[Any]) -> bool:
-    return inspect.isabstract(service_type)
-
-
-def _is_abstract_loose(service_type: Type[Any]) -> bool:
-    """Also treat leftover ``__abstractmethods__`` as a contract.
-
-    Classes built without ABCMeta -- or rebuilt by a decorator -- can carry
-    abstract methods that ``inspect.isabstract`` misses.
-    """
-
-    return inspect.isabstract(service_type) or bool(
-        getattr(service_type, "__abstractmethods__", ())
-    )
-
-
-_ABSTRACT_DETECTORS = {"strict": _is_abstract_strict, "loose": _is_abstract_loose}
-
-
-def _concrete_subclasses(
-    service_type: Type[Any],
-    is_abstract: Callable[[Type[Any]], bool] = _is_abstract_strict,
-) -> list[Type[Any]]:
+def _concrete_subclasses(service_type: Type[Any]) -> list[Type[Any]]:
     found: list[Type[Any]] = []
     seen: set[Type[Any]] = set()
 
@@ -115,12 +93,33 @@ def _concrete_subclasses(
             if child in seen:
                 continue
             seen.add(child)
-            if not is_abstract(child):
+            if not inspect.isabstract(child):
                 found.append(child)
             visit(child)
 
     visit(service_type)
     return found
+
+
+# Runs on the hot creation path, so the signature inspection is memoised. The
+# bounded cache keeps dynamically built classes from accumulating. Re-patching a
+# class cannot stale the answer: auto_inject copies the original __signature__
+# onto the wrapper it installs.
+@lru_cache(maxsize=1024)
+def _accepts_no_arguments(implementation: Type[Any]) -> bool:
+    try:
+        signature = inspect.signature(implementation.__init__)
+    except (TypeError, ValueError):
+        return True
+    for parameter in list(signature.parameters.values())[1:]:
+        if parameter.kind in {
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        }:
+            continue
+        if parameter.default is inspect.Parameter.empty:
+            return False
+    return True
 
 
 def _unwrap_annotation(annotation: Any) -> Any:
@@ -230,32 +229,20 @@ class Container:
         auto_discover: bool = False,
         strict_registrations: bool = False,
         discovery_root: str | None = None,
-        ambient_scope: bool = False,
-        abstract_detection: str = "strict",
     ) -> None:
         if auto_discover or discovery_root is not None:
             raise ValueError(
                 "Filesystem auto-discovery is not part of the safe core API. "
                 "Import implementations explicitly or use py_autowired.legacy."
             )
-        if abstract_detection not in _ABSTRACT_DETECTORS:
-            raise ValueError(
-                f"abstract_detection must be 'strict' or 'loose', got {abstract_detection!r}"
-            )
         self.registrations: Dict[Type[Any], ServiceRegistration] = {}
         self.strict_interfaces = strict_interfaces
         self.strict_registrations = strict_registrations
-        self.ambient_scope = ambient_scope
-        self.abstract_detection = abstract_detection
-        self._is_abstract = _ABSTRACT_DETECTORS[abstract_detection]
         self._implementation_selectors: Dict[Type[Any], Callable[[], Type[Any]]] = {}
         self.registration_history: list[tuple[str, Type[Any]]] = []
         self._registration_lock = threading.RLock()
         self._current_scope_var: contextvars.ContextVar[Optional[_ScopeState]] = (
             contextvars.ContextVar(f"py_autowired_scope_{id(self)}", default=None)
-        )
-        self._ambient_scope_var: contextvars.ContextVar[Optional[_ScopeState]] = (
-            contextvars.ContextVar(f"py_autowired_ambient_{id(self)}", default=None)
         )
         self._resolution_stack: contextvars.ContextVar[tuple[Type[Any], ...]] = (
             contextvars.ContextVar(f"py_autowired_stack_{id(self)}", default=())
@@ -285,18 +272,6 @@ class Container:
     def is_registered(self, service_type: Type[Any]) -> bool:
         return service_type in self.registrations
 
-    def _active_scope(self) -> Optional[_ScopeState]:
-        scope = self._current_scope_var.get()
-        if scope is not None or not self.ambient_scope:
-            return scope
-        # An ambient scope has no exit point, so nothing closes it. Callers that
-        # need finalization must wrap the work in scoped_function or a Scope.
-        scope = self._ambient_scope_var.get()
-        if scope is None:
-            scope = _ScopeState()
-            self._ambient_scope_var.set(scope)
-        return scope
-
     def set_implementation_selector(
         self, service_type: Type[Any], selector: Callable[[], Type[Any]]
     ) -> None:
@@ -307,7 +282,7 @@ class Container:
         without importing every candidate.
         """
 
-        if not self._is_abstract(service_type):
+        if not inspect.isabstract(service_type):
             raise TypeError(
                 f"An implementation selector needs an abstract type: {service_type.__name__}"
             )
@@ -320,7 +295,7 @@ class Container:
     ) -> Type[Any]:
         if implementation_type is not None:
             return implementation_type
-        if not self._is_abstract(service_type):
+        if not inspect.isabstract(service_type):
             if self.strict_interfaces:
                 raise TypeError(
                     f"Concrete type cannot be registered in strict interface mode: {service_type.__name__}"
@@ -333,12 +308,12 @@ class Container:
                 raise ResolutionError(
                     f"Implementation selector returned nothing for {service_type.__name__}"
                 )
-            if self._is_abstract(selected):
+            if inspect.isabstract(selected):
                 raise TypeError(
                     f"Selected implementation is not concrete: {selected.__name__}"
                 )
             return selected
-        candidates = _concrete_subclasses(service_type, self._is_abstract)
+        candidates = _concrete_subclasses(service_type)
         if not candidates:
             raise ResolutionError(
                 f"No imported concrete implementation found for {service_type.__name__}"
@@ -498,7 +473,7 @@ class Container:
                         registration.instance = self._create_instance(registration)
             return registration.instance
         if registration.scope == LifetimeScope.SCOPED:
-            scope = self._active_scope()
+            scope = self.current_scope
             if scope is None:
                 raise ScopeNotActiveError(
                     f"Scoped service requires an active scope: {service_type.__name__}"
@@ -522,9 +497,12 @@ class Container:
             implementation = registration.implementation_type
             if implementation is None:
                 raise ResolutionError(f"Registration has no implementation: {service_type.__name__}")
-            # Classes marked by auto_inject receive their dependencies as
-            # attributes after construction, so their __init__ must stay untouched.
-            if getattr(implementation, "__di_attrs__", ()):
+            # auto_inject fills these fields after construction, so a class that
+            # only uses field injection must not have its __init__ resolved. One
+            # that also takes constructor dependencies still gets them.
+            if getattr(implementation, "__di_attrs__", ()) and _accepts_no_arguments(
+                implementation
+            ):
                 return implementation()
             try:
                 signature = inspect.signature(implementation.__init__)
@@ -562,8 +540,6 @@ class Container:
         if inspect.iscoroutinefunction(function):
             @wraps(function)
             async def async_wrapper(*args: Any, **kwargs: Any):
-                if self._reuses_outer_scope():
-                    return await function(*args, **kwargs)
                 async with self.create_scope():
                     return await function(*args, **kwargs)
 
@@ -571,22 +547,10 @@ class Container:
 
         @wraps(function)
         def sync_wrapper(*args: Any, **kwargs: Any):
-            if self._reuses_outer_scope():
-                return function(*args, **kwargs)
             with self.create_scope():
                 return function(*args, **kwargs)
 
         return sync_wrapper
-
-    def _reuses_outer_scope(self) -> bool:
-        """Ambient mode shares one scope per context instead of nesting."""
-
-        if not self.ambient_scope:
-            return False
-        return (
-            self._current_scope_var.get() is not None
-            or self._ambient_scope_var.get() is not None
-        )
 
 
 class Scope:
