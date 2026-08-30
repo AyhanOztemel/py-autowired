@@ -6,6 +6,9 @@
 - Made name-based injection aware of public alias binding names.
 - Added the optional `auto_inject(..., exclude_dirs=...)` extension point.
 - Preserved the existing discovery exclusions when `exclude_dirs` is omitted.
+- Added the opt-in `__di_compat_aliases__` class attribute, which mirrors
+  assignments on legacy field names onto their canonical `*_instance` marker.
+- All changes are additive; 0.2.x code runs unchanged on 0.3.0.
 
 
 ## 0.2.1 - 2026-08-28
