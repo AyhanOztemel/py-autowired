@@ -1,0 +1,76 @@
+name: release
+
+# PyPI'ye yayin, Trusted Publishing (OIDC) ile yapilir; depoda saklanan bir
+# API token'i YOKTUR. PyPI, asagidaki dort bilgiyi eslestirerek kisa omurlu bir
+# kimlik uretir: sahip/depo = AyhanOztemel/py-autowired, workflow = release.yml,
+# environment = pypi.
+#
+# Tetikleme:
+#   - v ile baslayan bir tag push edilirse: build + publish.
+#   - elle (workflow_dispatch): yalnizca build. Yayin adimi atlanir, boylece
+#     is akisi hicbir sey yayinlamadan guvenle denenebilir.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      # tests.yml ile ayni kurulum: examples testleri django/fastapi/flask ister.
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev,examples]"
+
+      # Tag ile pyproject.toml surumunun ayrisması, yanlis surum yayinlamanin
+      # en yaygin yoludur; PyPI'de geri alinamadigi icin burada durduruluyor.
+      - name: Tag ile paket surumunu karsilastir
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(python -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "Tag $GITHUB_REF_NAME ile pyproject surumu $pkg_version uyusmuyor." >&2
+            exit 1
+          fi
+          echo "Surum dogrulandi: $pkg_version"
+
+      - run: python -m pytest -q
+
+      - run: python -m build
+      - run: python -m twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/py-autowired
+    permissions:
+      # Trusted Publishing icin gereken tek yetki budur ve yalnizca bu ise
+      # verilir; build isi hala salt okunur calisir.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
