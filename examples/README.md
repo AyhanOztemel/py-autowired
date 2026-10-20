@@ -1,6 +1,6 @@
 # Deep layered examples
 
-All four presentation technologies use the same deliberately deep application tree. The depth is intentional: it proves that `auto_inject()` discovers and patches runtime dependencies across nested folders instead of working only when classes share one directory.
+All four presentation technologies use the same deliberately deep application tree. They demonstrate that `auto_inject()` patches already-imported classes across nested folders and injects their runtime dependencies. The composition module imports the shared classes before autowiring; these examples do not demonstrate discovery of previously unimported modules under `examples/`, which is excluded from filesystem discovery.
 
 ```text
 examples/
@@ -40,11 +40,16 @@ Every consumer declares dependencies only as `self.<name>_instance = None`. Appl
 Open one of these entry-point files and choose **Run > Run Module (F5)** in IDLE:
 
 - `console_app/main.py`: prints the complete chain's result in the IDLE shell.
-- `fastapi_app/app.py`: starts at `http://127.0.0.1:8101/di-demo/Ayhan`.
+- `fastapi_app/app.py`: starts at `http://127.0.0.1:8101/di-demo/World`.
 - `flask_app/app.py`: starts at `http://127.0.0.1:8102/di-demo/Ayhan`.
 - `django_app/manage.py`: starts at `http://127.0.0.1:8103/di-demo/Ayhan`.
 
 No terminal command or manual `PYTHONPATH` setting is required. Install the optional framework dependencies from `examples/requirements.txt` once before running the web examples.
+
+The main FastAPI endpoint constructs `FastApiController().execute(name)` directly;
+its fields are populated automatically within the request scope. Optional
+FastAPI-style `Depends(injected(...))` parameter injection is demonstrated at
+`/di-demo-depends/World`.
 
 ## Visible proof in every output
 

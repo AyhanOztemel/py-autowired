@@ -1,5 +1,130 @@
 # Changelog
 
+## 0.5.0 - 2026-10-20
+
+### Fixed
+
+- Python 3.10 no longer differs from 3.11+: its `get_type_hints` turns
+  `dep: T = None` into `Optional[T]`, so the dependency was silently left `None`
+  on 3.10 only. That implicit Optional is now ignored; an explicitly written
+  `Optional[T]`/`T | None` keeps its previous behavior.
+
+- Concurrency (no new lock on any hot path; ready singletons and cache hits stay
+  lock-free): a selection computed from a pre-`refresh()` map is never cached;
+  closing a scope waits for an in-flight creation and disposes it (finalizers run
+  outside the lock, before the scope cache is cleared, as before); a cross-thread
+  cycle in first singleton creation raises `CircularDependencyError` instead of
+  deadlocking (wait-for detection only on a contended first creation).
+
+- A synchronous factory that returns a bare coroutine now raises
+  `AsyncFactoryError` (the coroutine is closed) instead of injecting/caching an
+  unexecuted coroutine. Other awaitables (pools, futures) are returned unchanged.
+- Disposal still raises the first exception (same object and type); additional
+  errors are no longer lost: they are attached as notes (`add_note` on 3.11+,
+  `__notes__` on 3.10) and logged at ERROR.
+- Discovery no longer counts a same-name module imported from another file as
+  successful discovery of the expected file; it logs WARNING with both paths
+  and preserves the existing import.
+- `AutoInjectionResolutionError` remains a `RuntimeError` and also inherits
+  `DependencyInjectionError`.
+- Publication requires the same commit's complete reusable `tests.yml` workflow:
+  Python 3.10, 3.14 and 3.14t.
+
+### Added
+
+- Mutation testing report (cosmic-ray, injection engine and container):
+  99.3% of behavior-changing mutants killed; equivalent mutants and the 9 open
+  ones are listed with their reasons in `docs/MUTATION_REPORT.md`.
+- Opt-in open generics (.NET open generic registration):
+  `register_open_generic(Repository, SqlRepository, scope)` serves
+  `Repository[User]`, `Repository[Order]`, ... on demand, with one lifetime slot
+  per closed type; TypeVar constructor parameters are substituted. Closed
+  generics resolve through `resolve()`, constructor injection and validation, and
+  are not part of name-based field injection. Registered types keep the same
+  lookup path.
+
+- Opt-in keyed services (.NET keyed services / Spring `@Qualifier`):
+  `register_keyed(Type, key, Impl, scope)`, `resolve_keyed(Type, key)` and
+  constructor parameters annotated `Annotated[Type, Keyed(key)]`. Keyed
+  registrations are separate from name-based field injection (unchanged); each
+  key has its own singleton/scoped instance and cycle detection.
+
+- Opt-in `Container.set_primary(Type)` (like Spring's `@Primary`): when several
+  registrations match an `*_instance` field, primary ones are preferred. Without
+  a primary mark, selection is exactly as before. Validation applies the same rule.
+
+- Opt-in deferred resolution: `Provider[T]` resolves on every call (respecting the
+  registered lifetime and the scope active at call time), `Lazy[T]` resolves once
+  on first `.value` access. Constructor parameters annotated with them are filled
+  automatically; both can also be built directly (`Provider(container, T)`).
+  A singleton holding `Provider[ScopedService]` does not capture the scoped
+  service, and opt-in validation accepts it. Field injection is unchanged.
+
+- Opt-in application shutdown: `Container.close()` / `await Container.aclose()`
+  dispose container-created singletons in reverse creation order, once per object.
+  Following .NET, instances supplied through `register_instance` are owned by the
+  caller and are not disposed. After closing, `resolve()` raises
+  `ContainerClosedError`. Call it after application work has stopped. No new lock
+  is taken on the resolution path.
+
+- Opt-in validation reports required untyped constructor parameters, singleton
+  capture of scoped dependencies through fields, constructors or declared factory
+  metadata, and inherited unannotated fields excluded from post-init injection.
+  Runtime injection and lifetime rules are unchanged.
+
+### Changed (diagnostics only)
+
+- WARNING logs are emitted by default for field-read failures (with traceback) and
+  discovery failures or unexpected module origins. These logs only add diagnostics;
+  field skipping and discovery behavior are unchanged. Tied candidates are not logged
+  at runtime; opt-in validation reports them. Logging handlers must not resolve
+  services from the same container.
+
+### Known limitations
+
+- After `replace()`, an alias still points to the previous registration.
+- Inherited unannotated fields gain no new injection.
+
+### Earlier changes in this release
+
+- Added opt-in `validate_autowiring()` and
+  `auto_inject(..., validate=True)` / `attach_container(..., validate=True)`.
+  `AutowiringValidationError.issues` aggregates unmatched fields, tied candidates,
+  and statically unresolvable registrations. The check does not construct
+  objects/services; it may evaluate type annotations that execute user code.
+- Replaced diagnostic library prints with English records on the `py_autowired` logger.
+  Debug mode adds a console StreamHandler; otherwise the library adds only a
+  NullHandler. Discovery import failures always emit logging WARNING records,
+  never Python warnings. `print_cache_stats()` writes to stdout (unchanged).
+- Made typed `*_instance: Service | None = None` fields the primary documentation
+  example, and added startup validation, pytest replacement recipes, measured
+  dataclass/slots/Pydantic compatibility, optional attrs tests, and a local
+  `timeit` benchmark with recorded machine-dependent results.
+- Added validation, logging, compatibility, replacement, and runtime regressions;
+  matching results/order, explicit assignments, and unmatched `None` behavior
+  are preserved. Existing tests remain intact.
+- Added the optional `py_autowired.fastapi` bridge: `attach_container()` installs
+  startup autowiring and one async scope per HTTP request; `injected()` supplies
+  automatically populated objects to FastAPI `Depends`.
+- Preserved application lifespans and request scopes through streaming,
+  background work, errors, and synchronous/asynchronous resource disposal.
+- Documented lifetime guidance: a singleton should not retain a scoped service
+  in a field; use a scoped owner. Opt-in validation now checks static captures,
+  with no runtime lifetime change.
+- Shielded FastAPI request-scope cleanup from active AnyIO cancellation and
+  wrapped the entire Starlette stack so user middleware and all exception
+  handlers, including Exception/500 handlers, retain the same request scope.
+- Made ordinary runtime controller construction the primary FastAPI example,
+  with FastAPI-style Depends injection as an optional alternative.
+- Added a Python 3.14t job that asserts the GIL is disabled, and a manual-only
+  mutation workflow targeting autowired.py and container.py with summary artifacts.
+- Added the `fastapi` extra, typing classifier, runtime injection keywords,
+  FastAPI example, concurrency/disposal tests, and automatic injection regressions.
+- Corrected package layout and factory signature documentation, and documented
+  the process-wide active container limit and trusted module discovery.
+- Automatic field matching, injection order, explicit assignments, unmatched
+  fields, and framework independence are preserved; container fixes appear above.
+
 ## 0.4.0 - 2026-08-30
 
 - Added `__init__.py`, so `from py_autowired import Container` now works.

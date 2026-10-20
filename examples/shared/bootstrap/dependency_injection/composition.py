@@ -21,15 +21,18 @@ from examples.shared.infrastructure.runtime.environment.metadata.providers.runti
 
 container = Container()
 _configured = False
+_registered = False
 
 
-def configure_dependencies() -> Container:
-    global _configured
-    if not _configured:
+def configure_dependencies(*, autowire: bool = True) -> Container:
+    global _configured, _registered
+    if not _registered:
         container.register_singleton(IRuntimeLabelProvider, RuntimeLabelProvider)
         container.register_transient(IMessageFormatter, TurkishMessageFormatter)
         container.register_scoped(IMessageRepository, MemoryMessageRepository)
         container.register_transient(GreetingService)
+        _registered = True
+    if autowire and not _configured:
         auto_inject(container, root_dir=str(PROJECT_ROOT))
         _configured = True
     return container
