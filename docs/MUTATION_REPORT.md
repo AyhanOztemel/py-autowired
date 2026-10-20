@@ -1,4 +1,4 @@
-# Mutation testing report (py-autowired 0.5.0)
+# Mutation testing report (py_autowired)
 
 Mutation testing changes the library's source code in small ways (for example
 `==` to `!=`, `+ 1` to `+ 2`, removing a `not`) and checks whether the test
@@ -107,3 +107,31 @@ test-command = "python -B -m pytest -x -q -p no:cacheprovider tests"
 [cosmic-ray.distributor]
 name = "local"
 ```
+
+## 0.5.1 additions
+
+The code added or changed in 0.5.1 - the Flask and Django bridges, the shared
+bridge module, the FastAPI shutdown and project-root changes, late-import
+patching, the extra contract prefixes and the deferred implementation lookup -
+was mutation tested the same way (every changed line, all operators):
+
+| | Count |
+|---|---:|
+| Mutants generated | 329 |
+| Killed by the tests | 285 (86.6%) |
+| Equivalent, proven | 41 |
+| Not killed, not proven equivalent | 3 |
+| **Kill rate over non-equivalent mutants** | **99.0%** |
+
+Equivalent: 22 inside type annotations of `fastapi.py` (never evaluated at
+runtime there), 4 on ASGI scope types (`!= "http"` vs `> "http"` / identity:
+only `http`, `websocket` and `lifespan` exist), 4 on the name `I_` alone (its
+empty key can never match a field), 4 sequence invariants (a single candidate;
+zero candidates handled before), 3 identity vs equality on classes, 2
+keyword-only markers on private helpers, 1 unreachable `relative_to` fallback,
+1 loop that re-checks its condition after `continue`, and 1 lock timeout value
+(timing only).
+
+Not proven (open): the `IndexError` branch when another thread empties the
+late-import queue between the check and the `pop()`, and the two module-name
+orderings for classes imported into another module (also open in 0.5.0).

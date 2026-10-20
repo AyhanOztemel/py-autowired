@@ -1,282 +1,328 @@
-# py-autowired Türkçe Kullanım Kılavuzu
+# py_autowired kullanım kılavuzu
 
-## Temel kural
+**Python için çalışma zamanı bağımlılık enjeksiyonu; sınıflarınız birbirini import etmez.**
 
-Doğrulama artık tipsiz zorunlu kurucu parametrelerini, singleton → scoped
-bağımlılıklarını (kurucu, otomatik alan ve factory metadata zincirleri dahil)
-ve kalıtılan anotasyonsuz alanları raporlar. Kalıtılan anotasyonsuz alan, alt
-sınıfın post-init enjeksiyon adaylarına eklenmez; yeni alan enjekte edilmez.
-Temel sınıf kurucusu veya açık atama alanı yine doldurabilir. Bu kontroller
-yalnız opt-in doğrulamadır; çalışma zamanı alan seçimi ve sırası değişmez.
-
-Eşit puanlı adaylarda ilk kayıt seçilir; bu durum çalışma anında loglanmaz,
-yalnız isteğe bağlı doğrulama (`validate=True`) raporlar.
-Alan okuma hatası traceback ile WARNING üretir ve alan yine atlanır.
-Keşif, import edilen dosyanın beklenen dosya olduğunu kontrol eder; uyuşmazlıkta
-WARNING yazar, mevcut modülü değiştirmez ve importu başarılı saymaz.
-Senkron factory çıplak bir coroutine döndürürse `AsyncFactoryError` yükselir ve
-coroutine kapatılır; diğer awaitable nesneler (havuz, future) olduğu gibi döner.
-Birden çok kapanış hatasında ilk hata aynı tip ve nesneyle yükselir; diğerleri not
-olarak eklenir ve loglanır. Aday seçimi: alan adı zaten qualifier gibi çalışır (`utc_clock_instance` → `UtcClock`).
-Birden fazla kayıt eşleşirse tercih edileni `container.set_primary(UtcClock)` ile işaretleyin
-(Spring `@Primary` gibi); işaret yoksa seçim eskisi gibidir. Aynı tipe birden çok uygulama anahtarla kaydedilebilir: `register_keyed(IClock, "utc", UtcClock)`,
-`resolve_keyed(IClock, "utc")` ve kurucuda `Annotated[IClock, Keyed("utc")]`. Anahtarlı kayıtlar
-`*_instance` alan eşleşmesine katılmaz.
-Açık generic kayıt (isteğe bağlı): `register_open_generic(Repository, SqlRepository)` ile
-`Repository[User]`, `Repository[Order]`... istendiğinde üretilir; her kapalı tipin kendi yaşam
-süresi vardır. Bunlar `*_instance` alan eşleşmesine katılmaz.
-Ertelenmiş çözümleme (isteğe bağlı): kurucu parametresini `Provider[T]` (her çağrıda
-çözer, o anki scope'a uyar) ya da `Lazy[T]` (ilk `.value` erişiminde bir kez çözer)
-olarak işaretleyin. Singleton, `Provider[ScopedServis]` tutarsa scoped servisi esir almaz.
-Uygulama kapanışı isteğe bağlıdır: iş bittikten sonra `container.close()` ya da
-`await container.aclose()` çağırın; container'ın oluşturduğu singleton'lar ters
-sırayla kapatılır, `register_instance` ile verilenler size aittir ve kapatılmaz.
-Eşzamanlılık: hazır singleton'lar ve önbellek isabetleri kilitsizdir. İki thread
-çevrimli singleton grafiğini aynı anda ilk kez çözse bile donma olmaz,
-`CircularDependencyError` yükselir. `refresh()` eski seçimi önbellekte bırakmaz;
-scope kapanışı, oluşturulmakta olan servisi de kapatır. Çevrimi açılışta
-`validate=True` ile yakalayın.
-
-Runtime bağımlılığı constructor parametresi veya manuel container çağrısı değildir:
+Bir sınıf yalnız neye ihtiyacı olduğunu yazar:
 
 ```python
-class SiparisServisi:
-    siparis_repository_instance: SiparisRepository | None = None
+class ProductService:
+    def __init__(self):
+        self.product_repository_instance = None   # kendiliğinden dolar
 ```
 
-`auto_inject()`, alan adındaki `siparis_repository` bölümünü kayıtlı
-`ISiparisRepository` veya `SiparisRepository` tipiyle eşleştirir ve nesneyi
-çalışma anında yerleştirir.
-Repository tipi önceden import edilmiş olmalıdır (veya ertelenmiş tip etiketleri
-kullanılmalıdır). Tip etiketi açıklama ve araç desteği içindir; eşleştirme yine
-alan adı ve modül yakınlığıyla yapılır. `= None` gereklidir: tek başına tip etiketi
-alanı başlatmaz. `self.siparis_repository_instance = None` bildirimi de desteklenir;
-açıkça atanmış `None` dışındaki değerler korunur. Tip denetleyicileri alanı
-kullanmadan önce bir `None` kontrolü isteyebilir.
+py_autowired `product_repository_instance` alanını çalışma anında doldurur.
+`ProductService` repository'yi import etmez, onu kurucu parametresi olarak
+almaz ve hiçbir container çağrısı yapmaz. Sınıflar birbirinden bağımsız kalır.
+Onları import eden tek yer bir `register/` klasörüdür.
+
+English: [README.md](README.md)
 
 ## Kurulum
 
 ```bash
-pip install py-autowired
+pip install py_autowired
 ```
 
-## Kayıt ve başlangıç
+## Hızlı başlangıç (FastAPI)
+
+**1. Sınıflarınız** - sözleşmelere (arayüz / abstract class) bağlıdır ve
+birbirini import etmez; bir uygulama yalnız uyguladığı sözleşmeyi import eder:
 
 ```python
-from py_autowired.autowired import auto_inject
-from py_autowired.container import Container
+# application/product_service.py
+from domain.product_service import IProductService
 
-container = Container()
-container.register_singleton(IClock, SystemClock)
-container.register_scoped(IUserRepository, SqliteUserRepository)
-container.register_transient(UserService)
+class ProductService(IProductService):
+    def __init__(self):
+        self.product_repository_instance = None   # -> IProductRepository
 
-# Uygulama başlangıcında yalnız bir kez:
-auto_inject(container, root_dir="/uygulamanin/mutlak/yolu")
+    def list_products(self):
+        return self.product_repository_instance.list_products()
+
+# presentation/product_controller.py
+class ProductController:
+    def __init__(self):
+        self.product_service_instance = None      # -> IProductService
+
+    def list_products(self):
+        return self.product_service_instance.list_products()
 ```
 
-`auto_inject()` çağrısından önce ilgili soyut ve somut sınıflar import edilmiş
-ve kayıtlar tamamlanmış olmalıdır. Enjekte edilecek uygulama nesnelerini bu
-çağrıdan sonra oluşturun.
-
-## Başlangıçta doğrulama (Validate at startup)
-
-Doğrulama varsayılanda kapalıdır. Açmak için
-`auto_inject(container, root_dir=..., validate=True)` veya
-`attach_container(app, container, root_dir=..., validate=True)` kullanın.
-FastAPI denetimi lifespan başlangıcında yapar. Yamalama sonrasında
-`from py_autowired import validate_autowiring; validate_autowiring(container)`
-ile tekrar denetleyebilirsiniz; bu fonksiyon yeni sınıf keşfetmez veya yamalamaz.
-
-`AutowiringValidationError.issues`, eşleşmeyen alanları, aynı en yüksek puanı alan
-farklı kayıtları ve statik olarak çözülemeyen tipleri tek raporda toplar.
-Aynı kaydın alias tekrarları belirsizlik sayılmaz; modül yakınlığı tek kazanan
-belirliyorsa hata verilmez. Denetim nesne/servis oluşturmaz, factory ve alan descriptor'ı
-çalıştırmaz, scope açmaz, çalışma zamanı çözümleme önbelleğini değiştirmez.
-Tip açıklamalarını değerlendirebilir; bu ifadeler yan etkili kullanıcı kodu çalıştırabilir.
-Zorunlu constructor bağımlılıkları, soyut tipler, döngüler ve
-`factory_dependencies` bilgisi incelenir. Factory gövdeleri, keyfi constructor
-kodu ve özel setter davranışları statik olarak garanti edilemez.
-Constructor içinde elle atanacak değerler önceden bilinemez; aday alanlar temkinli
-denetlenir. Sınıf düzeyindeki somut elle atamalar atlanır. `auto_inject` sırasında
-doğrulama başarısız olsa da yamalar kurulmuş kalır; grafiği düzeltin veya uygulama
-başlangıcını durdurun.
-
-## Testte servis değiştirme (Testing: swap a service)
-
-Yukarıdaki `SiparisServisi` ve mevcut `SiparisRepository` için pytest tarifi:
+**2. `register/register.py`** - sınıfları import eden tek dosya; her ihtiyaç
+için hangi sınıfın kullanılacağını ve ne kadar yaşayacağını söyler:
 
 ```python
-from py_autowired import Container, auto_inject
+from application.product_service import ProductService
+from domain.product_repository import IProductRepository
+from domain.product_service import IProductService
+from infrastructure.memory_product_repository import MemoryProductRepository
 
-class SahteSiparisRepository(SiparisRepository):
-    pass
 
-def test_degistirme():
-    container = Container()
-    container.register_transient(SiparisRepository)
-    container.replace(SiparisRepository, SahteSiparisRepository)
-    auto_inject(container, root_dir="/uygulamanin/mutlak/yolu", validate=True)
-    servis = SiparisServisi()
-    assert isinstance(servis.siparis_repository_instance, SahteSiparisRepository)
+def register(container):
+    container.register_scoped(IProductRepository, MemoryProductRepository)
+    container.register_transient(IProductService, ProductService)
 ```
 
-Her testte yeni container kullanın. Değiştirme otomatik enjeksiyon kurulduktan sonra
-yapılıyorsa yeni tüketicileri oluşturmadan önce
-`from py_autowired import refresh; refresh()` çağırın. Mevcut nesneler atanmış
-bağımlılıklarını korur. Etkin container süreç genelinde tek olduğundan farklı
-container kullanan testleri sıralı çalıştırın.
-
-## Uyumluluk (Compatibility)
-
-`tests/test_field_compatibility.py` ile Python 3.11 ve Pydantic 2.14.1 üzerinde
-ölçülen davranışlar:
-
-| Sınıf biçimi | Sonuç |
-| --- | --- |
-| `= None` içeren tip etiketli normal sınıf | Çalışır; açık `None` dışı atamalar korunur. |
-| Değiştirilebilir dataclass, `slots=True` dahil | Dekoratör sonrasında çalışır; constructor'a verilen elle atamalar korunur. |
-| `__slots__` | Alanın slot'u mevcut ve `__init__` içinde `None` ile başlatılmışsa çalışır; başlatılmamış slot boş kalır. |
-| Frozen dataclass, slot'lu/slot'suz | Desteklenmez; post-init ataması `AutoInjectionResolutionError` verir. |
-| Değiştirilebilir Pydantic v2 `BaseModel` | Servis tipleri için `arbitrary_types_allowed=True` ile çalışır; alanlar model doğrulaması ve `model_post_init` sonrasında dolar, yeniden tam model doğrulaması yapılmaz. |
-| Frozen Pydantic v2 | Desteklenmez; atama `AutoInjectionResolutionError` verir. |
-| `attrs` | Yerelde kurulu değil; değiştirilebilir/slot'lu/frozen testleri atlandı, uyumluluk doğrulanmadı. |
-
-Özgün atama hataları exception cause olarak korunur. Özel descriptor/setter'lar,
-başka model ayarları ve Pydantic v1 bu ölçümlerin kapsamında değildir. Statik
-doğrulama değişmez modelleri yazılabilir hâle getirmez.
-
-## Günlükleme ve performans ölçümü
-
-Kütüphane İngilizce iletileri `logging.getLogger("py_autowired")` üzerinden yazar.
-Varsayılanda yalnız `NullHandler` eklenir; keşif hatalarını görmek için uygulama
-logging ayarını yapın. Import hataları her zaman WARNING kaydı üretir, hata
-fırlatmaz ve Python `warnings` mekanizmasını kullanmaz. Import öncesinde
-`PY_AUTOWIRED_DEBUG=1` (veya yedek `DI_DEBUG=1`) ayarı DEBUG iletilerini ve stderr'e
-yazan kütüphane `StreamHandler`'ını açar. Normal işlem stdout'a yazmaz.
-`print_cache_stats()` stdout'a yazar (değişmedi).
-
-Yerel ölçüm: `python -B benchmarks/field_injection.py --number 100000 --repeat 5`.
-Windows AMD64 / Python 3.11.0 örneği: düz nesne 0,227 µs, otomatik enjeksiyon
-2,721 µs; ek süre 2,494 µs (toplam 11,97 kat). Beş tekrarın en iyisi alınmıştır;
-tek alan, hazır singleton ve sıcak önbellek ölçülür. Başlangıç ve bağımlılık
-oluşturma maliyeti dahil değildir. Sonuç makinenize göre değişir; Python sürümü
-ve bağımlılık grafiği de etkilidir. Performans garantisi değildir.
-
-## Yaşam süreleri
-
-- `register_singleton`: Uygulama süresince aynı nesne.
-- `register_scoped`: Bir scope içinde aynı, sonraki scope'ta yeni nesne.
-- `register_transient`: Her enjeksiyonda yeni nesne.
-- `register_instance`: Önceden oluşturulmuş nesneyi kullanır.
-- `register_factory`: Nesneyi `factory(container)` çağrısıyla oluşturur; factory
-  kullanmasa bile container tek argüman olarak her zaman geçirilir.
+**3. `bootstrap/bootstrap.py`** - uygulama nasıl ayağa kalkar:
 
 ```python
-container.register_factory(UserService, lambda container: UserService())
+from py_autowired import Container
+from py_autowired.fastapi import attach_container
+
+from register import register
+
+
+def bootstrap(app):
+    container = Container(strict_interfaces=True)   # yalnız sözleşmeler kaydedilebilir
+    register(container)
+    attach_container(app, container)
 ```
 
-Console, Flask ve Django gibi senkron yollarda:
-
-```python
-with container.create_scope():
-    controller = UserController()
-    result = controller.execute()
-```
-
-FastAPI gibi asenkron yollarda:
-
-```python
-async with container.create_scope():
-    controller = UserController()
-    result = await controller.execute()
-```
-
-## FastAPI köprüsü ve kapsam sınırı
-
-`py-autowired[fastapi]` ile kayıtları tamamladıktan sonra köprüyü bağlayın:
+**4. `main.py`** - tek çağrı:
 
 ```python
 from fastapi import FastAPI
-from py_autowired.fastapi import attach_container
+from bootstrap import bootstrap
+from presentation.product_controller import ProductController
 
 app = FastAPI()
-attach_container(app, container, root_dir="/uygulamanin/mutlak/yolu")
+bootstrap(app)
 
-@app.get("/users")
-def users():
-    return UserController().execute()
+@app.get("/products")
+def products():
+    return ProductController().list_products()   # alanlar zaten dolu
 ```
 
-Başlangıçta otomatik alan enjeksiyonu etkinleşir. Endpoint içinde yalnız nesne
-oluşturmanız yeterlidir; alanları kendiliğinden dolar. Her HTTP isteği ayrı
-kapsam kullanır; streaming ve arka plan işleri tamamlanınca kaynaklar kapatılır.
-Asenkron kapanış aktif AnyIO iptalinden korunur. WebSocket bağlantıları bu HTTP
-köprüsünün kapsamı dışındadır.
+`uvicorn main:app` ya da `python main.py` ile çalıştırın. `root_dir`, lifespan
+ya da middleware yazmanız gerekmez: proje FastAPI açılırken (lifespan içinde)
+taranır, her istek kendi scope'unu alır, FastAPI kapanırken singleton'lar
+kapatılır. Projenin tamamı: [examples/fastapi](examples/fastapi).
 
-İstek kapsamı Starlette ara katman yığınının tamamını sarar. Kullanıcı ara
-katmanları ve genel `Exception`/500 dahil tüm istisna işleyicileri aynı açık
-kapsamı paylaşır ve istek kapsamlı otomatik enjeksiyonu kullanabilir. Kapsam,
-yanıt ve arka plan işleri tamamlandıktan sonra kapanır.
+## Üç kural
 
-FastAPI tarzı isteğe bağlı parametre enjeksiyonu için `fastapi` modülünden
-`Depends`, `py_autowired.fastapi` modülünden `injected` import ederek
-`controller=Depends(injected(UserController))` kullanabilirsiniz.
+1. **Bildir, import etme.** Adı `_instance` ile biten ve `None` atanmış alan bir
+   bağımlılıktır. Adı sözleşmeyi seçer: `product_service_instance` demek
+   `IProductService` demektir (bkz. *Adlandırma*). Sizin atadığınız bir değerin
+   üzerine yazılmaz; eşleşen kaydı olmayan alan `None` kalır.
+2. **Tek yerde kaydet.** `register/` sınıfları import eder; her ihtiyaç için
+   hangi sınıfın oluşturulacağını ve ne kadar yaşayacağını söyler.
+3. **Bir kez ayağa kaldır.** `bootstrap/` container'ı oluşturur, kayıtları ekler
+   ve framework'ü tek köprü çağrısıyla bağlar (bkz. *Framework'ler*); giriş
+   dosyası `bootstrap(...)`'ı bir kez çağırır.
 
-## Etkin container ve yaşam süresi önerisi
+Tip açıklaması isteğe bağlıdır
+(`product_service_instance: IProductService | None = None` de çalışır). Editörünüze
+yardım eder ama import gerektirir; py_autowired için ad tek başına yeterlidir.
 
-Her süreçte tek etkin otomatik enjeksiyon container'ı desteklenir. Sınıf yamaları
-ve etkin isim haritası süreç genelindedir; farklı container kullanan eşzamanlı
-uygulamaları ayrı süreçlerde çalıştırın. Aynı container içindeki istek kapsamları
-context değişkenleriyle birbirinden ayrılır.
+## Adlandırma: hangi alana hangi sınıf gelir
 
-**Yaşam süresi uyarısı:** Singleton bir nesnenin scoped servisi alanında tutması
-önerilmez; scoped sahip kullanın. Böylece istek kaynakları kapsam kapandıktan
-sonra tutulmaz. Bu yalnızca belge uyarısıdır; çalışma zamanı davranışı değişmez.
+Alanın adı (`_instance` olmadan) kayıtlı sözleşme ve sınıf adlarıyla
+karşılaştırılır. Alt çizgi ve büyük/küçük harf fark etmez; şu sözleşme önekleri
+(ve `Impl` soneki) tanınır:
 
-## Katmanlı mimari
+| Sözleşme adı | Onu alan alan |
+| --- | --- |
+| `IProductService`, `I_ProductService` | `product_service_instance` |
+| `ABSProductService`, `ABS_ProductService` | `product_service_instance` |
+| `AbsProductService`, `Abs_ProductService` | `product_service_instance` |
+| `absProductService`, `abs_ProductService` | `product_service_instance` |
+| `ProductServiceImpl` | `product_service_instance` |
+| `ProductService` (sözleşmesiz) | `product_service_instance` |
 
-- Domain: soyut repository/port.
-- Infrastructure: somut repository/adaptör.
-- Application: `self.repository_instance = None` kullanan servis.
-- Composition: kayıtlar ve tek `auto_inject()` çağrısı.
-- Presentation: Console, FastAPI, Flask veya Django controller/view.
+Önek yalnız ardından büyük harf (ya da alt çizgi) gelirse sayılır; böylece
+`Absolute` ya da `Ignore...` gibi adlar sıradan kelime olarak kalır.
 
-Sunum ve uygulama katmanlarında manuel bağımlılık çözümleme çağrısı kullanılmaz. Ayrıntılı, çalışan örnekler `examples/` klasöründedir.
+## Servis kaydı: `container.register_*`
 
-## İsim eşleştirme
+| Çağrı | Yaşam süresi | Ne için |
+| --- | --- | --- |
+| `container.register_singleton(IClock, SystemClock)` | bütün uygulama için tek nesne | ayarlar, saat, paylaşılabilen istemciler |
+| `container.register_scoped(IRepo, SqlRepo)` | scope başına bir nesne (bir web isteği) | veritabanı oturumu, iş birimi |
+| `container.register_transient(IProductService, ProductService)` | her seferinde yeni nesne | durumsuz servisler |
+| `container.register_instance(Settings, settings)` | verdiğiniz nesne | kendi oluşturduğunuz nesneler; py_autowired onları kapatmaz |
 
-Alan mutlaka küçük harfle başlamalı ve `_instance` ile bitmelidir:
+- `register_*(Sözleşme, Uygulama)` - en açık biçim.
+- `register_*(Sözleşme)` - py_autowired sözleşmenin tek uygulamasını kendisi
+  bulur; uygulama başka bir katmanda olsa bile.
+- `register_*(SomutSınıf)` - sınıf kendi uygulamasıdır.
+  `Container(strict_interfaces=True)` ile buna izin verilmez.
+- **Yalnız sözleşme:** `Container(strict_interfaces=True)` (bütün örneklerde
+  kullanılır) kayıt tipi olarak yalnız arayüz / abstract class kabul eder.
+  Böylece projedeki her bağımlılık somut bir sınıfa değil, bir soyutlamaya
+  bağlanır.
+- `register_*` satırlarını uygulama sınıflarını import eden tek yer olan
+  `register/` içinde tutun.
+- Bir sınıfı, **başka bir sınıf ona ihtiyaç duyduğunda** kaydedin. Yalnız
+  bağımlılık alan bir sınıf (controller) normal oluşturulur: `ProductController()`.
+- `close()`/`dispose()` (ya da `aclose()`) metodu olan scoped nesneler scope
+  bitince kapatılır. Container'ın oluşturduğu singleton'lar uygulama kapanınca
+  (web köprüleri) ya da siz `container.close()` çağırınca kapatılır.
 
-- `user_repository_instance` → `IUserRepository`
-- `payment_service_instance` → `PaymentService`
-- `audit_instance` → `ABS_Audit`
+## Framework'ler
 
-Bir ad birden fazla kayda uyuyorsa modül yakınlığı kullanılır. Belirsiz kayıtları
-önlemek için servis adlarını açık ve benzersiz tutun.
+Her örnek, aynı katmanlara ve kendi README'sine sahip eksiksiz bir projedir.
 
-## Kırmızı çizgi
+| Framework | Köprü çağrısı (`bootstrap/` içinde) | Scope | Örnek |
+| --- | --- | --- | --- |
+| Console | `auto_inject(container)` | `with container.create_scope():` | [examples/console](examples/console) |
+| FastAPI | `attach_container(app, container)` | her HTTP isteği | [examples/fastapi](examples/fastapi) |
+| Flask | `attach_container(app, container)` | her HTTP isteği | [examples/flask](examples/flask) |
+| Django | `application = attach_container(application, container)` | her HTTP isteği | [examples/django](examples/django) |
 
-Bağımlılığı `self.repository_instance = None` atamasıyla veya
-`repository_instance = None` sınıf alanıyla bildirin. Açıkça atanmış `None`
-dışındaki değerler korunur; kayıtla eşleşmeyen alanlar `None` kalır. Her iki
-bildirim biçimi aynı servis eşleştirme ve yaşam süresi kurallarını kullanır.
+Köprüyü `py_autowired.fastapi`, `py_autowired.flask` ya da `py_autowired.django`
+modülünden import edin. Her köprü proje klasörünü kendisi bulur
+(`requirements.txt`, `pyproject.toml`, `.git`, `main.py`/`app.py`; Django'da
+`manage.py` olan klasör), onu bir kez tarar, her isteğe bir scope açar ve
+uygulama kapanırken singleton'ları kapatır.
 
-## IDLE ile tek tuşla çalıştırma
+## İsteğe bağlı özellikler
 
-Terminal komutu yazmanız gerekmez. IDLE içinde aşağıdaki ana dosyalardan birini açın ve **Run > Run Module (F5)** seçin:
+Yukarıdaki kurulum için bunların hiçbiri gerekmez. Her biri belirli bir sorunu
+çözer; yalnız o sorun varsa kullanın.
 
-- Console: `examples/console_app/main.py`
-- FastAPI: `examples/fastapi_app/app.py` — `http://127.0.0.1:8101/di-demo/Ayhan`
-- Flask: `examples/flask_app/app.py` — `http://127.0.0.1:8102/di-demo/Ayhan`
-- Django: `examples/django_app/manage.py` — `http://127.0.0.1:8103/di-demo/Ayhan`
+### Açılışta doğrulama
 
-Web örnekleri için `examples/requirements.txt` içindeki isteğe bağlı framework bağımlılıklarının bir kez kurulmuş olması gerekir. Kaynak klasöründen çalıştırırken ayrıca `PYTHONPATH` ayarlamanız gerekmez.
+**Neden:** eksik bir kayıt normalde ancak alan kullanılınca ortaya çıkar.
+**Faydası:** bütün bağlantı sorunları açılışta, tek hatada raporlanır.
+**Kullanımı:**
 
-## Derin klasör kanıtı
+```python
+attach_container(app, container, validate=True)   # her köprü
+auto_inject(container, validate=True)             # console
+```
 
-`examples/shared` bilinçli olarak düz tutulmamıştır. Domain sözleşmeleri, use-case, repository, formatter, runtime sağlayıcı ve composition root farklı ve iç içe klasörlerdedir. Çalışan enjeksiyon zinciri şöyledir:
+Eşleşen kaydı olmayan alanları, eşit derecede uygun adayları, çözülemeyen kurucu
+bağımlılıklarını, bağımlılık döngülerini ve scoped bir servisi tutacak
+singleton'ları listeler. Yalnız okur, hiçbir servis oluşturmaz. Sonradan tekrar
+kontrol için: `validate_autowiring(container)` (`.issues` içeren
+`AutowiringValidationError` fırlatır).
 
-`Controller -> GreetingService -> MemoryMessageRepository -> TurkishMessageFormatter -> RuntimeLabelProvider`
+### `Provider[T]` ve `Lazy[T]`
 
-Bu zincirdeki her bağımlılık yalnız `self.<ad>_instance = None` bildirimiyle yerleştirilir. Böylece örnekler, klasör ve modül derinliği arttığında da `auto_inject()` mekanizmasının çalıştığını doğrular.
+**Neden:** bazen bir nesne baştan oluşturulmamalıdır; pahalıdır ya da bir isteğe
+aittir ama onu tutan nesne daha uzun yaşar.
+**Faydası:** nesneyi gerektiği anda oluşturmak.
+**Kullanımı** (kurucu parametreleri):
+
+```python
+from py_autowired import Lazy, Provider
+
+class ReportService:
+    def __init__(self, sessions: Provider[Session], exporter: Lazy[PdfExporter]):
+        self.sessions = sessions    # self.sessions() -> o anki scope'un Session'ı
+        self.exporter = exporter    # self.exporter.value -> ilk kullanımda oluşur, sonra aynısı
+```
+
+Bir singleton `Provider[ScopedServis]` tutabilir: her çağrı o anda etkin olan
+scope'tan çözülür.
+
+### Birden çok uygulama arasında seçim: `set_primary`
+
+**Neden:** kayıtlı iki sınıf aynı alan adıyla eşleşiyor.
+**Faydası:** alan adlarını değiştirmeden kazananı bir kez belirlemek.
+**Kullanımı:** `container.set_primary(UtcClock)` (Spring'deki `@Primary` gibi).
+Yoksa tüketicinin modülüne en yakın sınıf kazanır.
+
+### Anahtarlı servisler
+
+**Neden:** bir arayüzün birlikte kullanılan birkaç uygulaması var
+(örneğin UTC ve yerel saat).
+**Faydası:** uygulamayı bir anahtarla seçmek.
+**Kullanımı:**
+
+```python
+from typing import Annotated
+from py_autowired import Keyed
+
+container.register_keyed(IClock, "utc", UtcClock)
+container.register_keyed(IClock, "local", LocalClock)
+
+class Invoice:
+    def __init__(self, clock: Annotated[IClock, Keyed("utc")]): ...
+```
+
+Anahtarlı kayıtlar `*_instance` alanlarıyla değil, kurucu ve `resolve`
+üzerinden kullanılır.
+
+### Açık generic kayıt
+
+**Neden:** birçok tipin aynı türde servise ihtiyacı var (`Repository[User]`,
+`Repository[Order]`, ...).
+**Faydası:** tek kayıt hepsine hizmet eder.
+**Kullanımı:**
+
+```python
+container.register_open_generic(Repository, SqlRepository)   # class SqlRepository(Repository[T])
+```
+
+Kapalı generic'ler `*_instance` alanlarıyla değil, kurucu ve `resolve`
+üzerinden kullanılır.
+
+### Container'ı kendiniz kapatmak
+
+**Neden:** köprüsü olmayan bir konsol programı ya da betik kaynaklarını
+bırakmalı.
+**Faydası:** singleton'lar oluşturuldukları sıranın tersiyle kapatılır.
+**Kullanımı:** iş bitince `container.close()` ya da `await container.aclose()`.
+Framework köprüleri bunu uygulama kapanırken zaten yapar. `register_instance`
+ile verilen nesneler hiçbir zaman kapatılmaz. `close()` sonrasında `resolve()`
+`ContainerClosedError` fırlatır.
+
+### Testlerde servis değiştirmek
+
+**Neden:** test gerçek veritabanı yerine sahte bir sınıf kullanmalı.
+**Faydası:** test edilen kod değişmez.
+**Kullanımı:**
+
+```python
+container.replace(IProductRepository, FakeProductRepository)
+```
+
+Her test için yeni bir container kullanın. Otomatik enjeksiyon başladıktan
+sonra bir kaydı değiştirirseniz yeni tüketiciler oluşturmadan önce
+`refresh()` çağırın.
+
+### FastAPI parametre tarzı
+
+**Neden:** bazı uç noktalarda FastAPI'nin `Depends` yapısını tercih ediyorsunuz.
+**Kullanımı:** `controller=Depends(injected(ProductController))`; `injected`
+`py_autowired.fastapi` içinden gelir. Nesnenin alanları aynı şekilde dolar.
+
+### Log ve hata ayıklama çıktısı
+
+Kütüphane `logging.getLogger("py_autowired")` üzerinden log yazar ve varsayılan
+olarak sessizdir. Tarama sorunları WARNING olarak loglanır. Ayrıntılı DEBUG
+çıktısı için import'tan önce `PY_AUTOWIRED_DEBUG=1` ayarlayın.
+
+## Notlar
+
+- **Eşzamanlılık:** hazır singleton'lar ve önbellek okumaları kilitsizdir. Bir
+  bağımlılık döngüsü, iki thread aynı anda çarpsa bile donma yerine
+  `CircularDependencyError` verir. Testler GIL'siz CPython 3.14t'de de koşar.
+- **Süreç başına bir container:** sınıf yamaları süreç geneline uygulanır; ayrı
+  uygulamaları ayrı süreçlerde çalıştırın.
+- **Tarama modülleri import eder:** proje klasörü altındaki modüller import
+  edilir. Import edilmemesi gereken klasörler için `exclude_dirs` kullanın.
+  Proje içindeki `tests` ve `examples` klasörleri kendiliğinden atlanır.
+- **`resolve()` senkrondur:** ham coroutine döndüren fabrika
+  `AsyncFactoryError` verir.
+- **Uyumluluk:** sıradan sınıflar, `__slots__`, değiştirilebilir dataclass'lar ve
+  değiştirilebilir Pydantic v2 modelleri (`arbitrary_types_allowed=True` ile)
+  çalışır. Dondurulmuş dataclass ve Pydantic modellerine alan atanamaz (nedenini
+  `AutoInjectionResolutionError` açıklar).
+- **Hız:** sıcak önbellekte enjekte edilen bir alan, nesne oluşturma başına
+  birkaç mikrosaniye ekler; kendi makinenizde ölçmek için
+  `python -B benchmarks/field_injection.py --number 100000 --repeat 5`.
+
+## Test kalitesi
+
+Testler CPython 3.10, 3.11, 3.14 ve GIL'siz 3.14t üzerinde koşar. Enjeksiyon
+motoru ve container cosmic-ray ile mutasyon testinden geçirildi: 1399 mutant;
+davranışı değiştirebilenlerin **%99,3**'ü yakalandı (tümünün %88,0'ı; geri
+kalanların eşdeğer olduğu gerekçeleriyle kanıtlandı). Ne yakalanan ne de eşdeğer
+olduğu kanıtlanan 9 mutant açıkça listelendi. Rapor:
+[docs/MUTATION_REPORT.md](https://github.com/AyhanOztemel/py-autowired/blob/main/docs/MUTATION_REPORT.md).
+
+## Lisans
+
+MIT

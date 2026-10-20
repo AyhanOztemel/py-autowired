@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.5.1 - 2026-10-20
+
+A simpler setup. Runtime field injection (`self.x_instance = None`) works
+exactly as before.
+
+### Added
+
+- More contract prefixes match a field name: `I_Service`, and `ABSService`,
+  `AbsService`, `absService` without an underscore (next letter upper case),
+  besides the existing `IService`, `ABS_`/`Abs_`/`abs_` and the `Impl` suffix.
+- Flask bridge: `py_autowired.flask.attach_container(app, container)`.
+- Django bridge: `application = py_autowired.django.attach_container(application, container)`
+  (WSGI and ASGI; no settings change).
+  Both give every request its own scope (kept open while the response is sent),
+  scan the project once on the first request, and dispose container-created
+  singletons when the process exits.
+- Four self-contained examples (`examples/console`, `fastapi`, `flask`,
+  `django`), each with the same layers, a `register/` folder (the only place
+  that imports the classes), a `bootstrap/` folder (container + registrations +
+  bridge) and its own README in English and Turkish. Every registered service
+  has a contract and the containers use `strict_interfaces=True`. The shared
+  example folder is gone.
+
+### Fixed
+
+- No `*_instance` field is missed because of where or when its module loads:
+  a project module imported after startup - a lazy import, a `_private.py`
+  file, a class in a package `__init__.py`, or a file in a folder that
+  discovery skips (`dist`, `env`, `tests`, ...) - is patched the moment it is
+  imported. Modules outside the project are never touched.
+- Registering only an interface (`register_scoped(IRepo)`) no longer fails when
+  the implementation lives in another, not yet imported layer: the
+  implementation is looked up again after the startup scan or on first resolve.
+  A missing implementation is reported when resolving (and by `validate=True`).
+- `attach_container` (FastAPI) needs no `root_dir`: the project root is
+  searched from the file that calls it, so `uvicorn main:app` works too.
+  Previously the root was guessed from `__main__`, which is the server under
+  `uvicorn main:app`, and the fields stayed `None`.
+- `attach_container` (FastAPI) now disposes container-created singletons when
+  the application stops; a later startup creates fresh ones. Turn it off with
+  `close_on_shutdown=False`. Objects given to `register_instance` are never
+  disposed.
+- Discovery skipped every module of a project that itself lives under a folder
+  named `examples`, `tests`, `build`, ... Excluded names now apply only to
+  folders inside the project.
+
+### Changed
+
+- The distribution name is written `py_autowired` (PyPI treats it as the same
+  project as `py-autowired`; `pip install` works with either spelling).
+- README and the Turkish guide rewritten: quick start, the three rules,
+  `container.register_*`, frameworks, then every optional feature in its own
+  section. `USAGE_GUIDE_EN.md` now points to the README.
+
 ## 0.5.0 - 2026-10-20
 
 ### Fixed

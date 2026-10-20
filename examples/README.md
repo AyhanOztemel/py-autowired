@@ -1,56 +1,44 @@
-# Deep layered examples
+# Examples
 
-All four presentation technologies use the same deliberately deep application tree. They demonstrate that `auto_inject()` patches already-imported classes across nested folders and injects their runtime dependencies. The composition module imports the shared classes before autowiring; these examples do not demonstrate discovery of previously unimported modules under `examples/`, which is excluded from filesystem discovery.
+Four complete, independent projects. Each one has the same layers, a
+`register/` folder and its own README that explains that framework step by
+step. Nothing is shared between them: copy any one folder and it runs.
 
-```text
-examples/
-  shared/
-    domain/contracts/
-      messaging/message_repository.py
-      formatting/message_formatter.py
-      metadata/runtime_label_provider.py
-    application/use_cases/greetings/
-      greeting_service.py
-    infrastructure/
-      persistence/adapters/memory/repositories/message_repository.py
-      presentation/formatting/turkish_message_formatter.py
-      runtime/environment/metadata/providers/runtime_label_provider.py
-    bootstrap/dependency_injection/
-      composition.py
-  console_app/main.py
-  fastapi_app/app.py
-  flask_app/app.py
-  django_app/manage.py
-```
+| Example | Run (inside the folder) | Read |
+| --- | --- | --- |
+| [console](console) | `python main.py` | [README](console/README.md) · [Türkçe](console/README.tr.md) |
+| [fastapi](fastapi) | `python main.py` or `uvicorn main:app --port 8001` | [README](fastapi/README.md) · [Türkçe](fastapi/README.tr.md) |
+| [flask](flask) | `python app.py` or `flask --app app run --port 8002` | [README](flask/README.md) · [Türkçe](flask/README.tr.md) |
+| [django](django) | `python manage.py runserver 8003` | [README](django/README.md) · [Türkçe](django/README.tr.md) |
 
-The injected chain crosses all those layers:
+Install first: `pip install -r requirements.txt` (inside the folder).
+
+## The same idea in every example
 
 ```text
-Presentation controller
-  -> GreetingService
-    -> MemoryMessageRepository
-      -> TurkishMessageFormatter
-        -> RuntimeLabelProvider
+domain/          contracts (interfaces) - no code
+infrastructure/  implementations of the contracts
+application/     business logic          - imports nothing, uses *_instance fields
+presentation/    controllers and routes  - imports nothing, uses *_instance fields
+register/        the ONLY place that imports the classes and sets their lifetimes,
+                 and the one call that connects the framework
 ```
 
-Every consumer declares dependencies only as `self.<name>_instance = None`. Application and presentation code contains no manual dependency-resolution calls. No `__init__.py` files are required for this namespace-package example.
+---
 
-## Run directly from IDLE or an editor
+# Örnekler
 
-Open one of these entry-point files and choose **Run > Run Module (F5)** in IDLE:
+Dört eksiksiz ve birbirinden bağımsız proje. Hepsinde aynı katmanlar, bir
+`register/` klasörü ve o framework'ü adım adım anlatan kendi README'si var.
+Aralarında paylaşılan hiçbir şey yok: herhangi bir klasörü kopyalayın, çalışır.
+Çalıştırma komutları yukarıdaki tabloda; önce klasörün içinde
+`pip install -r requirements.txt`.
 
-- `console_app/main.py`: prints the complete chain's result in the IDLE shell.
-- `fastapi_app/app.py`: starts at `http://127.0.0.1:8101/di-demo/World`.
-- `flask_app/app.py`: starts at `http://127.0.0.1:8102/di-demo/Ayhan`.
-- `django_app/manage.py`: starts at `http://127.0.0.1:8103/di-demo/Ayhan`.
-
-No terminal command or manual `PYTHONPATH` setting is required. Install the optional framework dependencies from `examples/requirements.txt` once before running the web examples.
-
-The main FastAPI endpoint constructs `FastApiController().execute(name)` directly;
-its fields are populated automatically within the request scope. Optional
-FastAPI-style `Depends(injected(...))` parameter injection is demonstrated at
-`/di-demo-depends/World`.
-
-## Visible proof in every output
-
-Console prints every chain level line by line. FastAPI, Flask, and Django return the same five entries in the `injection_trace` JSON field. Each entry includes `module`, `module_depth`, `class`, `injected_field`, `injected_type`, `method`, `result`, and `instance_id`, so successful deep auto-injection is directly observable instead of inferred from one greeting.
+```text
+domain/          sözleşmeler (arayüzler) - kod yok
+infrastructure/  sözleşmelerin uygulamaları
+application/     iş mantığı               - hiçbir şey import etmez, *_instance alanları kullanır
+presentation/    controller ve route'lar  - hiçbir şey import etmez, *_instance alanları kullanır
+register/        sınıfları import eden ve yaşam sürelerini belirleyen TEK yer;
+                 framework'ü bağlayan tek çağrı da buradadır
+```
