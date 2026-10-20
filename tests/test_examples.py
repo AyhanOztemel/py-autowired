@@ -1,3 +1,9 @@
+"""The four examples are self-contained projects; each runs in its own process.
+
+Every example has the same layers and a register/ folder that is the only place
+importing the application classes. Consumers declare ``self.x_instance = None``.
+"""
+
 from pathlib import Path
 import importlib.util
 import os
@@ -8,22 +14,37 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+EXAMPLES = ROOT / "examples"
+LAYER_FILES = [
+    "domain/product_repository.py",
+    "domain/clock.py",
+    "domain/product_service.py",
+    "infrastructure/memory_product_repository.py",
+    "infrastructure/system_clock.py",
+    "application/product_service.py",
+    "presentation/product_controller.py",
+    "register/register.py",
+    "bootstrap/bootstrap.py",
+    "requirements.txt",
+    "README.md",
+    "README.tr.md",
+]
+# Consumers never import other layers; an implementation may import only the
+# contract it implements (from domain/).
+CONSUMERS = {"application/product_service.py": ("from domain.",),
+             "presentation/product_controller.py": ()}
 
 
-def _environment():
+def _run_in(example, code):
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(ROOT)
-    return environment
-
-
-def _run(arguments):
+    environment["PYTHONPATH"] = str(ROOT / "src")
     return subprocess.run(
-        [sys.executable, "-B", *arguments],
-        cwd=ROOT,
-        env=_environment(),
+        [sys.executable, "-B", "-c", code],
+        cwd=EXAMPLES / example,
+        env=environment,
         text=True,
         capture_output=True,
-        timeout=30,
+        timeout=60,
         check=False,
     )
 
@@ -31,7 +52,8 @@ def _run(arguments):
 def test_runtime_package_stays_minimal():
     package = ROOT / "src" / "py_autowired"
     files = sorted(path.name for path in package.glob("*.py"))
-    assert files == ["__init__.py", "autowired.py", "container.py", "fastapi.py"]
+    assert files == ["__init__.py", "_web.py", "autowired.py", "container.py", "django.py",
+                     "fastapi.py", "flask.py"]
     assert (package / "py.typed").is_file()
 
 
@@ -44,127 +66,77 @@ def test_public_api_is_importable_from_the_package_root():
     assert not [name for name in py_autowired.__all__ if not hasattr(py_autowired, name)]
 
 
-def test_console_direct_source_run_needs_no_pythonpath_src():
-    result = _run([str(ROOT / "examples" / "console_app" / "main.py")])
-    assert result.returncode == 0, result.stderr
-    assert "Runtime DI calisiyor" in result.stdout
-    assert "AUTO_INJECT DERINLIK ZINCIRI" in result.stdout
-    assert "MemoryMessageRepository.message_for()" in result.stdout
-    assert "RuntimeLabelProvider.label()" in result.stdout
+@pytest.mark.parametrize("example", ["console", "fastapi", "flask", "django"])
+def test_every_example_is_complete_and_self_contained(example):
+    base = EXAMPLES / example
+    missing = [rel for rel in LAYER_FILES if not (base / rel).is_file()]
+    assert not missing, missing
+    assert "py_autowired" in (base / "requirements.txt").read_text(encoding="utf-8")
+    for rel, allowed in CONSUMERS.items():
+        text = (base / rel).read_text(encoding="utf-8")
+        statements = [line.strip() for line in text.splitlines()]
+        imports = [s for s in statements if s.startswith(("import ", "from "))]
+        assert all(s.startswith(allowed) for s in imports) if allowed else not imports, (rel, imports)
+        assert "_instance = None" in text, rel
+    bootstrap = (base / "bootstrap" / "bootstrap.py").read_text(encoding="utf-8")
+    assert "Container(strict_interfaces=True)" in bootstrap
+    assert not (EXAMPLES / "shared").exists()
 
 
-@pytest.mark.parametrize(
-    ("module_name", "probe"),
-    [
-        (
-            "fastapi",
-            "from fastapi.testclient import TestClient;"
-            "from examples.fastapi_app.app import app;"
-            "client=TestClient(app);client.__enter__();"
-            "home=client.get('/');assert home.status_code==200;assert '/di-demo/World' in home.text;response=client.get('/di-demo/FastAPI');legacy=client.get('/hello/FastAPI');assert legacy.status_code==200;"
-            "assert response.status_code==200;"
-            "assert 'FastAPI' in response.json()['message'];assert len(response.json()['injection_trace'])==5;assert max(step['module_depth'] for step in response.json()['injection_trace'])>=8;"
-            "optional=client.get('/di-demo-depends/FastAPI');assert optional.status_code==200;"
-            "assert optional.json()['message']==response.json()['message'];"
-            "assert len(optional.json()['injection_trace'])==5;assert max(step['module_depth'] for step in optional.json()['injection_trace'])>=8;"
-            "client.__exit__(None,None,None)",
-        ),
-        (
-            "flask",
-            "from examples.flask_app.app import app;"
-            "client=app.test_client();home=client.get('/');assert home.status_code==200;assert '/di-demo/Ayhan' in home.get_data(as_text=True);response=client.get('/di-demo/Flask');legacy=client.get('/hello/Flask');assert legacy.status_code==200;"
-            "assert response.status_code==200;"
-            "assert 'Flask' in response.get_json()['message'];assert len(response.get_json()['injection_trace'])==5;assert max(step['module_depth'] for step in response.get_json()['injection_trace'])>=8",
-        ),
-        (
-            "django",
-            "import os;os.environ.setdefault("
-            "'DJANGO_SETTINGS_MODULE','examples.django_app.runtime_di_demo.settings');"
-            "import django;django.setup();"
-            "from django.test import Client;"
-            "client=Client();home=client.get('/');assert home.status_code==200;assert '/di-demo/Ayhan' in home.content.decode();response=client.get('/di-demo/Django');legacy=client.get('/hello/Django/');assert legacy.status_code==200;"
-            "assert response.status_code==200;"
-            "assert 'Django' in response.json()['message'];assert len(response.json()['injection_trace'])==5;assert max(step['module_depth'] for step in response.json()['injection_trace'])>=8",
-        ),
-    ],
-)
-def test_web_layered_examples_without_pythonpath_src(module_name, probe):
-    if importlib.util.find_spec(module_name) is None:
-        pytest.skip(f"optional dependency not installed: {module_name}")
-    result = _run(["-c", probe])
-    assert result.returncode == 0, result.stderr
-
-
-def test_application_and_examples_do_not_resolve_manually():
+def test_examples_never_resolve_by_hand():
     forbidden = ("container." + "resolve(", "provider" + "(", "provide" + "(")
-    paths = list((ROOT / "examples").rglob("*.py"))
-    paths += [ROOT / "KULLANIM_KILAVUZU_TR.md", ROOT / "USAGE_GUIDE_EN.md"]
-    for path in paths:
+    for path in EXAMPLES.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
         for token in forbidden:
             assert token not in text, f"{token} found in {path}"
 
-def test_all_examples_have_editor_run_entry_points():
-    entry_points = [
-        ROOT / "examples" / "console_app" / "main.py",
-        ROOT / "examples" / "fastapi_app" / "app.py",
-        ROOT / "examples" / "flask_app" / "app.py",
-        ROOT / "examples" / "django_app" / "manage.py",
-    ]
-    for path in entry_points:
-        text = path.read_text(encoding="utf-8")
-        assert 'if __name__ == "__main__":' in text, path
 
-    fastapi_text = entry_points[1].read_text(encoding="utf-8")
-    flask_text = entry_points[2].read_text(encoding="utf-8")
-    django_text = entry_points[3].read_text(encoding="utf-8")
-    assert "uvicorn.run(app" in fastapi_text
-    assert "use_reloader=False" in flask_text
-    assert "len(arguments) == 1" in django_text
-
-def test_deep_layered_runtime_injection_chain():
-    probe = (
-        "from examples.shared.bootstrap.dependency_injection.composition "
-        "import configure_dependencies;"
-        "from examples.shared.application.use_cases.greetings.greeting_service "
-        "import GreetingService;"
-        "from examples.shared.infrastructure.persistence.adapters.memory.repositories.message_repository "
-        "import MemoryMessageRepository;"
-        "from examples.shared.infrastructure.presentation.formatting.turkish_message_formatter "
-        "import TurkishMessageFormatter;"
-        "from examples.shared.infrastructure.runtime.environment.metadata.providers.runtime_label_provider "
-        "import RuntimeLabelProvider;"
-        "container=configure_dependencies();"
-        "scope=container.create_scope();scope.__enter__();"
-        "service=GreetingService();"
-        "repository=service.message_repository_instance;"
-        "formatter=repository.message_formatter_instance;"
-        "label_provider=formatter.runtime_label_provider_instance;"
-        "assert isinstance(repository,MemoryMessageRepository);"
-        "assert isinstance(formatter,TurkishMessageFormatter);"
-        "assert isinstance(label_provider,RuntimeLabelProvider);"
-        "assert service.greet('Derinlik')=='Merhaba, Derinlik! Runtime DI calisiyor.';"
-        "scope.__exit__(None,None,None)"
+def test_console_example():
+    result = subprocess.run(
+        [sys.executable, "-B", "main.py"],
+        cwd=EXAMPLES / "console",
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+        text=True, capture_output=True, timeout=60, check=False,
     )
-    result = _run(["-c", probe])
     assert result.returncode == 0, result.stderr
+    assert "['Notebook', 'Pencil', 'Eraser']" in result.stdout
 
 
-def test_shared_example_is_structurally_deep_not_flat():
-    shared = ROOT / "examples" / "shared"
-    obsolete_flat_files = [
-        shared / "application.py",
-        shared / "composition.py",
-        shared / "domain.py",
-        shared / "infrastructure.py",
-    ]
-    assert not any(path.exists() for path in obsolete_flat_files)
+WEB_PROBES = {
+    "fastapi": (
+        "from fastapi.testclient import TestClient\n"
+        "from main import app\n"
+        "with TestClient(app) as client:\n"
+        "    for _ in range(2):\n"
+        "        body = client.get('/products').json()\n"
+        "        assert body['products'] == ['Notebook', 'Pencil', 'Eraser'], body\n"),
+    "flask": (
+        "from app import app\n"
+        "client = app.test_client()\n"
+        "for _ in range(2):\n"
+        "    response = client.get('/products')\n"
+        "    assert response.get_json()['products'] == ['Notebook', 'Pencil', 'Eraser']\n"
+        "    response.close()\n"),
+    "django": (
+        "import wsgiref.util\n"
+        "from shop_site.wsgi import application\n"
+        "for _ in range(2):\n"
+        "    environ = {}\n"
+        "    wsgiref.util.setup_testing_defaults(environ)\n"
+        "    environ['PATH_INFO'] = '/products'\n"
+        "    environ['HTTP_HOST'] = '127.0.0.1'\n"
+        "    status = []\n"
+        "    result = application(environ, lambda s, h, e=None: status.append(s))\n"
+        "    body = b''.join(result)\n"
+        "    result.close()\n"
+        "    assert status[0].startswith('200'), status\n"
+        "    assert b'Notebook' in body, body\n"),
+}
 
-    deep_files = [
-        shared / "application" / "use_cases" / "greetings" / "greeting_service.py",
-        shared / "infrastructure" / "persistence" / "adapters" / "memory" / "repositories" / "message_repository.py",
-        shared / "infrastructure" / "runtime" / "environment" / "metadata" / "providers" / "runtime_label_provider.py",
-        shared / "bootstrap" / "dependency_injection" / "composition.py",
-    ]
-    assert all(path.is_file() for path in deep_files)
-    assert max(len(path.relative_to(shared).parts) for path in deep_files) >= 6
+
+@pytest.mark.parametrize("example", ["fastapi", "flask", "django"])
+def test_web_example(example):
+    if importlib.util.find_spec(example) is None:
+        pytest.skip(f"optional dependency not installed: {example}")
+    result = _run_in(example, WEB_PROBES[example])
+    assert result.returncode == 0, result.stderr

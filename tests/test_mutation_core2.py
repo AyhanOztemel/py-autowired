@@ -192,8 +192,9 @@ def test_abstract_registration_picks_single_implementation_or_fails():
     assert type(container.resolve(Shape)) is Square
     with pytest.raises(AmbiguousImplementationError):
         container.register_transient(Abstract2)
+    container.register_transient(Lonely)               # 0.5.1: looked up when first resolved
     with pytest.raises(ResolutionError):
-        container.register_transient(Lonely)
+        container.resolve(Lonely)
 
 
 def test_refresh_reports_whether_a_cache_exists(monkeypatch):

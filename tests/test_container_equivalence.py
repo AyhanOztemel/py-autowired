@@ -217,8 +217,10 @@ def test_nested_scoped_functions_stay_isolated():
 def test_resolution_error_keeps_its_only_base_class():
     assert issubclass(ResolutionError, DependencyInjectionError)
     assert not issubclass(ResolutionError, ValueError)
+    container = Container()
+    container.register(ABS_Unimplemented)          # 0.5.1: looked up when first resolved
     with pytest.raises(ResolutionError):
-        Container().register(ABS_Unimplemented)
+        container.resolve(ABS_Unimplemented)
 
 
 def test_the_constructor_takes_no_new_settings():
