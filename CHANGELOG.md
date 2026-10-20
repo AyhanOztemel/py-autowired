@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.5.2 - 2026-10-20
+
+Several implementations of one contract, as in .NET DI and Spring, through the
+same `*_instance` fields. Existing code behaves as before.
+
+### Added
+
+- Registering a contract again with another class keeps both:
+  `register_scoped(IRepo, MemoryRepo)` + `register_scoped(IRepo, SqlRepo)`.
+  - A field named after a class receives that class (`memory_repo_instance`).
+  - The contract's own field receives the last registration, exactly as before
+    and as `resolve()` (`repo_instance`).
+  - A plural field receives all of them as a list, in registration order
+    (`repo_instances`), like .NET `IEnumerable<T>` / Spring `List<T>`.
+  - Each registration keeps its own lifetime; registering the same class again
+    adds no second copy; `replace()` removes the earlier ones.
+- `container.resolve_all(T)` (and `scope.resolve_all(T)`): every registration
+  of `T` in registration order; an empty list if there is none.
+- `validate=True` also checks every registration behind a plural field.
+
+### Fixed
+
+- Field names with upper case letters were silently ignored and stayed `None`
+  (`sqlRepo_instance`, `SqlRepo_instance`), although the README said upper/lower
+  case does not matter. All four spellings now work:
+  `sql_repo_instance`, `sqlrepo_instance`, `sqlRepo_instance`, `SqlRepo_instance`.
+
 ## 0.5.1 - 2026-10-20
 
 A simpler setup. Runtime field injection (`self.x_instance = None`) works

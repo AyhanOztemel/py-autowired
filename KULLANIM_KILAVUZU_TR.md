@@ -132,6 +132,20 @@ karşılaştırılır. Alt çizgi ve büyük/küçük harf fark etmez; şu sözl
 Önek yalnız ardından büyük harf (ya da alt çizgi) gelirse sayılır; böylece
 `Absolute` ya da `Ignore...` gibi adlar sıradan kelime olarak kalır.
 
+**Alan adı nasıl yazılabilir?** Alan adındaki alt çizgi ve büyük/küçük harf de
+fark etmez. Bu dört alanın dördü de `SqlProductRepository` alır:
+
+```python
+self.sql_product_repository_instance = None    # Python tarzı (önerilen)
+self.sqlproductrepository_instance = None
+self.sqlProductRepository_instance = None      # Java / C# tarzı
+self.SqlProductRepository_instance = None
+```
+
+Yalnız son kısım sabittir: `_instance` tek nesne alır, `_instances` bir
+sözleşmenin bütün uygulamalarını liste olarak alır (bkz. *Bir sözleşmenin
+birden çok uygulaması*).
+
 ## Servis kaydı: `container.register_*`
 
 | Çağrı | Yaşam süresi | Ne için |
@@ -146,7 +160,9 @@ karşılaştırılır. Alt çizgi ve büyük/küçük harf fark etmez; şu sözl
   bile.
 - `register_*(Sözleşme, Uygulama)` - bir sözleşmenin birden çok uygulaması
   varsa gerekir. Yazılmazsa py_autowired tahmin yürütmez,
-  `AmbiguousImplementationError` hatasıyla durur.
+  `AmbiguousImplementationError` hatasıyla durur. Birkaçını birden kullanmak
+  için sözleşmeyi her sınıf için bir kez kaydedin (bkz. *Bir sözleşmenin
+  birden çok uygulaması*).
 - `register_*(SomutSınıf)` - sınıf kendi uygulamasıdır.
   `Container(strict_interfaces=True)` ile buna izin verilmez.
 - **Yalnız sözleşme:** `Container(strict_interfaces=True)` (bütün örneklerde
@@ -219,6 +235,51 @@ class ReportService:
 Bir singleton `Provider[ScopedServis]` tutabilir: her çağrı o anda etkin olan
 scope'tan çözülür.
 
+### Bir sözleşmenin birden çok uygulaması
+
+**Neden:** tek sözleşme, yan yana kullanılan birkaç sınıf - örneğin bellek ve
+SQL repository'si ya da birkaç bildirim kanalı.
+**Faydası:** .NET'teki (`IEnumerable<T>`) ve Spring'deki (`List<T>`) gibi bütün
+uygulamalar kullanılabilir - yine `*_instance` alanlarıyla, import ve kurucu
+parametresi olmadan.
+**Nasıl:** sözleşmeyi her sınıf için bir kez kaydedin:
+
+```python
+# register/register.py
+container.register_scoped(IProductRepository, MemoryProductRepository)
+container.register_scoped(IProductRepository, SqlProductRepository)
+```
+
+```python
+# application/report_service.py - hiçbir şey import etmez
+class ReportService:
+    def __init__(self):
+        self.memory_product_repository_instance = None  # -> MemoryProductRepository
+        self.sql_product_repository_instance = None     # -> SqlProductRepository
+        self.product_repository_instance = None         # -> SqlProductRepository (son kaydedilen)
+        self.product_repository_instances = None        # -> [MemoryProductRepository, SqlProductRepository]
+
+    def count(self):
+        return sum(len(repo.list_products()) for repo in self.product_repository_instances)
+```
+
+| Alan | Ne alır |
+| --- | --- |
+| sınıf adında (`sql_product_repository_instance`) | o sınıfı |
+| sözleşme adında (`product_repository_instance`) | son kaydedilen sınıfı - eskisi gibi, `resolve()` ile aynı |
+| sözleşme adı + `_instances` (`product_repository_instances`) | hepsini liste olarak, kayıt sırasıyla |
+
+- Her kayıt kendi yaşam süresini korur (singleton, scoped ya da transient).
+- Aynı sınıfı yeniden kaydetmek ikinci bir kopya eklemez; `replace()`
+  sözleşmenin bütün önceki kayıtlarını siler.
+- Alan kullanmayan kodda: `container.resolve_all(IProductRepository)` aynı
+  listeyi döndürür.
+- Sınıf yazmadan yalnız `register_scoped(IProductRepository)` yazılırsa ve iki
+  uygulama varsa yine `AmbiguousImplementationError` ile durur: py_autowired
+  hangisini kastettiğinizi tahmin etmez.
+- `Container(strict_registrations=True)` bir sözleşmenin iki kez kaydedilmesini
+  yasaklar; bu özellik orada kullanılamaz.
+
 ### Birden çok uygulama arasında seçim: `set_primary`
 
 **Neden:** kayıtlı iki sınıf aynı alan adıyla eşleşiyor.
@@ -245,7 +306,8 @@ class Invoice:
 ```
 
 Anahtarlı kayıtlar `*_instance` alanlarıyla değil, kurucu ve `resolve`
-üzerinden kullanılır.
+üzerinden kullanılır. Alanlarla *Bir sözleşmenin birden çok uygulaması*
+yöntemini kullanın: orada anahtarın yerini sınıf adı tutar.
 
 ### Açık generic kayıt
 
@@ -323,7 +385,10 @@ Testler CPython 3.10, 3.11, 3.14 ve GIL'siz 3.14t üzerinde koşar. Enjeksiyon
 motoru ve container cosmic-ray ile mutasyon testinden geçirildi: 1399 mutant;
 davranışı değiştirebilenlerin **%99,3**'ü yakalandı (tümünün %88,0'ı; geri
 kalanların eşdeğer olduğu gerekçeleriyle kanıtlandı). Ne yakalanan ne de eşdeğer
-olduğu kanıtlanan 9 mutant açıkça listelendi. Rapor:
+olduğu kanıtlanan 9 mutant açıkça listelendi. 0.5.1'de eklenen kod: 329 mutant,
+davranışı değiştirebilenlerin **%99,0**'ı; 0.5.2'de değişen kod (bir sözleşmenin
+birden çok uygulaması, büyük harfli alan adları): 216 mutant, davranışı
+değiştirebilenlerin **%100**'ü yakalandı. Rapor:
 [docs/MUTATION_REPORT.md](https://github.com/AyhanOztemel/py-autowired/blob/main/docs/MUTATION_REPORT.md).
 
 ## Lisans

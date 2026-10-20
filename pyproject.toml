@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "py_autowired"
-version = "0.5.1"
+version = "0.5.2"
 description = "Runtime dependency injection without imports between your classes: self.x_instance = None"
 readme = "README.md"
 requires-python = ">=3.10"

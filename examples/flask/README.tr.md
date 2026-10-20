@@ -91,10 +91,19 @@ def bootstrap(app):
 | `register_transient` | `IProductService` → `ProductService` | her ihtiyaçta yeni bir nesne |
 
 **Birden çok uygulama mı var?** Bir sözleşmenin iki uygulaması varsa (örneğin
-`MemoryProductRepository` ve `SqlProductRepository`) py_autowired tahmin
-yürütmez, `AmbiguousImplementationError` hatasıyla durur. O zaman kullanılacak
-sınıfı ikinci argüman olarak yazın:
-`container.register_scoped(IProductRepository, SqlProductRepository)`.
+`MemoryProductRepository` ve `SqlProductRepository`) yalnız sözleşmeyi yazmak
+yetmez: py_autowired tahmin yürütmez, `AmbiguousImplementationError` hatasıyla
+durur. Kullanmak istediğiniz her sınıfı kaydedin:
+
+```python
+container.register_scoped(IProductRepository, MemoryProductRepository)
+container.register_scoped(IProductRepository, SqlProductRepository)
+```
+
+O zaman `memory_product_repository_instance` ve `sql_product_repository_instance`
+kendi sınıfını, `product_repository_instance` son kaydedileni,
+`product_repository_instances` ise ikisini birden liste olarak alır. Ayrıntı:
+ana kılavuzdaki *Bir sözleşmenin birden çok uygulaması* başlığı.
 
 `ProductController` kaydedilmez: yalnız bağımlılık *alır*, onu siz
 `ProductController()` diye oluşturursunuz. Başka bir sınıfın ihtiyaç duyduğu
@@ -113,6 +122,11 @@ karşılaştırılır. Alt çizgi ve büyük/küçük harf fark etmez; şu sözl
 | `AbsProductRepository`, `Abs_ProductRepository` | `product_repository_instance` |
 | `absProductRepository`, `abs_ProductRepository` | `product_repository_instance` |
 | `ProductRepositoryImpl` | `product_repository_instance` |
+
+Alanın kendisi şu dört biçimden biriyle yazılabilir; dördü de aynı nesneyi
+alır: `product_repository_instance`, `productrepository_instance`,
+`productRepository_instance`, `ProductRepository_instance`. Yalnız son kısım
+sabittir: `_instance` (tek nesne) ya da `_instances` (bütün uygulamalar, liste).
 
 ## Yalnız sözleşme: `strict_interfaces=True`
 

@@ -136,6 +136,20 @@ prefixes (and the `Impl` suffix) are understood:
 A prefix counts only when the next letter is upper case (or an underscore
 follows), so names such as `Absolute` or `Ignore...` stay ordinary words.
 
+**How a field may be spelled.** Underscores and upper/lower case in the field
+name do not matter either. These four fields all receive `SqlProductRepository`:
+
+```python
+self.sql_product_repository_instance = None    # Python style (recommended)
+self.sqlproductrepository_instance = None
+self.sqlProductRepository_instance = None      # Java / C# style
+self.SqlProductRepository_instance = None
+```
+
+Only the ending is fixed: `_instance` receives one object, `_instances` receives
+every implementation of a contract as a list (see *Several implementations of
+one contract*).
+
 ## Registering services: `container.register_*`
 
 | Call | Lifetime | Use it for |
@@ -150,7 +164,8 @@ follows), so names such as `Absolute` or `Ignore...` stay ordinary words.
   another layer.
 - `register_*(Contract, Implementation)` - needed when a contract has more than
   one implementation. Without it py_autowired does not guess; it stops with
-  `AmbiguousImplementationError`.
+  `AmbiguousImplementationError`. Register the contract once per class to use
+  several of them (see *Several implementations of one contract*).
 - `register_*(ConcreteClass)` - the class is its own implementation. Not allowed
   with `Container(strict_interfaces=True)`.
 - **Contracts only:** `Container(strict_interfaces=True)` (used in every example)
@@ -222,6 +237,51 @@ class ReportService:
 A singleton may safely hold `Provider[ScopedService]`: every call resolves from
 the scope active at that moment.
 
+### Several implementations of one contract
+
+**Why:** one contract, several classes used side by side - for example a
+memory and a SQL repository, or several notification channels.
+**Benefit:** as in .NET (`IEnumerable<T>`) and Spring (`List<T>`), every
+implementation is available - still through `*_instance` fields, with no
+imports and no constructor parameters.
+**How:** register the contract once for each class:
+
+```python
+# register/register.py
+container.register_scoped(IProductRepository, MemoryProductRepository)
+container.register_scoped(IProductRepository, SqlProductRepository)
+```
+
+```python
+# application/report_service.py - imports nothing
+class ReportService:
+    def __init__(self):
+        self.memory_product_repository_instance = None  # -> MemoryProductRepository
+        self.sql_product_repository_instance = None     # -> SqlProductRepository
+        self.product_repository_instance = None         # -> SqlProductRepository (the last one)
+        self.product_repository_instances = None        # -> [MemoryProductRepository, SqlProductRepository]
+
+    def count(self):
+        return sum(len(repo.list_products()) for repo in self.product_repository_instances)
+```
+
+| Field | Receives |
+| --- | --- |
+| named after a class (`sql_product_repository_instance`) | that class |
+| named after the contract (`product_repository_instance`) | the last registered class - as before, and as `resolve()` |
+| contract name + `_instances` (`product_repository_instances`) | all of them as a list, in registration order |
+
+- Each registration keeps its own lifetime (singleton, scoped or transient).
+- Registering the same class again does not add a second copy;
+  `replace()` removes all earlier registrations of the contract.
+- In code without fields: `container.resolve_all(IProductRepository)` returns
+  the same list.
+- `register_scoped(IProductRepository)` alone, without a class, still stops
+  with `AmbiguousImplementationError` when two implementations exist:
+  py_autowired does not guess which one you mean.
+- `Container(strict_registrations=True)` forbids registering a contract twice,
+  so this feature is not available there.
+
 ### Choosing between several implementations: `set_primary`
 
 **Why:** two registered classes both match a field name.
@@ -248,7 +308,8 @@ class Invoice:
 ```
 
 Keyed registrations are used through constructors and `resolve`, not through
-`*_instance` fields.
+`*_instance` fields. With fields, use *Several implementations of one contract*:
+there the class name works as the key.
 
 ### Open generics
 
@@ -328,7 +389,9 @@ behavior (88.0% of all mutants; the rest are proven equivalent, each with its
 reason). The 9 mutants that are neither killed nor proven equivalent are listed
 openly. The code added in 0.5.1 (bridges, late imports, prefixes) was tested
 the same way: 329 mutants, **99.0%** killed among those that can change
-behavior. Full report: [docs/MUTATION_REPORT.md](https://github.com/AyhanOztemel/py-autowired/blob/main/docs/MUTATION_REPORT.md).
+behavior; the code changed in 0.5.2 (several implementations per contract,
+upper case field names): 216 mutants, **100%** of those that can change
+behavior killed. Full report: [docs/MUTATION_REPORT.md](https://github.com/AyhanOztemel/py-autowired/blob/main/docs/MUTATION_REPORT.md).
 
 ## License
 

@@ -35,7 +35,11 @@ if DEBUG_MODE:
 # 🆕 v2: Eski davranış (TÜM sınıfları patch'le) için kaçış kapısı.
 #        Varsayılan: sadece '*_instance' adayı olan sınıflar patch'lenir.
 PATCH_ALL_MODE = os.getenv("PY_AUTOWIRED_PATCH_ALL", os.getenv("DI_PATCH_ALL", "")).lower() in ("1", "true", "yes")
-_DEF_ATTR_RE = re.compile(r'^[a-z][a-z0-9_]*_instance$')
+# A field ends in _instance (one object) or _instances (every registration of a
+# contract). Upper and lower case are both accepted: product_repository_instance,
+# productRepository_instance and ProductRepository_instance name the same thing.
+_DEF_ATTR_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_]*_instances?$')
+_ALL = "*"  # name-map key prefix of plural (*_instances) fields
 
 # 🆕 v2: Keşif sırasında atlanacak dizinler (.venv tuzağı düzeltmesi)
 _EXCLUDED_DIRS = {
@@ -97,6 +101,47 @@ class AutoInjectionResolutionError(DependencyInjectionError, RuntimeError):
 def _norm(s: str) -> str:
     """✅ Cached normalization - pure function"""
     return s.replace("_", "").lower()
+
+
+@lru_cache(maxsize=1024)
+def _field_key(name: str):
+    """Name-map key of a field: 'sqlRepo_instance' -> 'sqlrepo',
+    'repo_instances' -> ('*', 'repo') (every registration of the contract)."""
+    if name.endswith("_instances"):
+        return (_ALL, _norm(name[:-len("_instances")]))
+    return _norm(name[:-len("_instance")])
+
+
+def _generic_key(name: str) -> Optional[str]:
+    """The name without its contract prefix or Impl suffix, if it has one."""
+    # ABS_Service / Abs_Service / abs_Service -> service
+    if name.startswith('ABS_') and len(name) > 4:
+        return _norm(name[4:])
+    elif name.startswith('Abs_') and len(name) > 4:
+        return _norm(name[4:])
+    elif name.startswith('abs_') and len(name) > 4:
+        return _norm(name[4:])
+    # I_Service -> service
+    elif name.startswith('I_') and len(name) > 2:
+        return _norm(name[2:])
+    # ABSService / AbsService / absService -> service (no underscore; the next
+    # letter must be upper case, so "Absolute" stays a word)
+    elif name[:3] in ('ABS', 'Abs', 'abs') and len(name) > 3 and name[3].isupper():
+        return _norm(name[3:])
+    # IService -> service
+    elif name.startswith('I') and len(name) > 1 and name[1].isupper():
+        return _norm(name[1:])
+    # ServiceImpl -> service
+    elif name.endswith('Impl'):
+        return _norm(name[:-4])
+    return None
+
+
+def _contract_keys(service_type) -> set:
+    """Keys under which a contract itself is found (full name and generic name)."""
+    keys = {_norm(service_type.__name__), _generic_key(service_type.__name__)}
+    keys.discard(None)
+    return keys
 
 
 @lru_cache(maxsize=1024)
@@ -219,45 +264,27 @@ def _build_name_map_from_container(container):
             key2 = _norm(it.__name__)
             name_map[key2].append(reg)
 
-        # Generic names
+        # Generic names (prefix / Impl suffix removed)
         for typ in {st, it}:
-            name = typ.__name__
-
-            # ABS_Service -> service (🎯 YENI!)
-            if name.startswith('ABS_') and len(name) > 4:
-                generic_key = _norm(name[4:])
+            generic_key = _generic_key(typ.__name__)
+            if generic_key is not None:
                 name_map[generic_key].append(reg)
 
-            # Abs_Service -> service (🎯 YENI!)
-            elif name.startswith('Abs_') and len(name) > 4:
-                generic_key = _norm(name[4:])
-                name_map[generic_key].append(reg)
+        # Plural fields (repo_instances) find the contract by its own names.
+        for key in _contract_keys(st):
+            name_map[(_ALL, key)].append(reg)
 
-            # Abs_Service -> service (🎯 YENI!)
-            elif name.startswith('abs_') and len(name) > 4:
-                generic_key = _norm(name[4:])
-                name_map[generic_key].append(reg)
-
-            # I_Service -> service
-            elif name.startswith('I_') and len(name) > 2:
-                generic_key = _norm(name[2:])
-                name_map[generic_key].append(reg)
-
-            # ABSService / AbsService / absService -> service (no underscore;
-            # the next letter must be upper case, so "Absolute" stays a word)
-            elif name[:3] in ('ABS', 'Abs', 'abs') and len(name) > 3 and name[3].isupper():
-                generic_key = _norm(name[3:])
-                name_map[generic_key].append(reg)
-
-            # IService -> service (MEVCUT)
-            elif name.startswith('I') and len(name) > 1 and name[1].isupper():
-                generic_key = _norm(name[1:])
-                name_map[generic_key].append(reg)
-
-            # ServiceImpl -> service (MEVCUT)
-            elif name.endswith('Impl'):
-                generic_key = _norm(name[:-4])
-                name_map[generic_key].append(reg)
+    # Earlier registrations of a contract (register_scoped(IRepo, MemoryRepo)
+    # followed by register_scoped(IRepo, SqlRepo)) are found by their class
+    # name only; the contract's own names keep answering with the current one.
+    for st, earlier in list(getattr(container, "_earlier", {}).items()):
+        taken = _contract_keys(st)
+        for reg in list(earlier):
+            it = reg.implementation_type
+            if it is None or it is st:
+                continue
+            for key in {_norm(it.__name__), _generic_key(it.__name__)} - taken - {None}:
+                name_map[key].append(reg)
 
     if DEBUG_MODE:
         logger.debug("Name map built:")
@@ -324,9 +351,14 @@ def _pick_best_registration(regs, ctx_module: str):
     return selected
 
 
-def _resolve_via_container(container, reg):
-    """ORIGINAL FUNCTION - unchanged"""
-    return container.resolve(reg.service_type)
+def _resolve_via_container(container, reg, every=False):
+    """Resolve the selected registration; ``every`` returns the whole list."""
+    if every:
+        return container.resolve_all(reg.service_type)
+    if getattr(container, "registrations", {}).get(reg.service_type, reg) is reg:
+        return container.resolve(reg.service_type)
+    # An earlier registration of the contract, selected by its class name.
+    return container._resolve_registration(reg)
 
 def _lookup_registration(container, name_map, normalized_name: str, context_module: str):
     """Return the registration and the container that owns its active cache.
@@ -414,11 +446,10 @@ def _patch_setattr(cls, container, name_map):
             value = getattr(self, marker_name)
             return orig_setattr(self, name, value)
         if value is None and _DEF_ATTR_RE.match(name):
-            base = name[:-len("_instance")]
-            normalized_base = _norm(base)
+            normalized_base = _field_key(name)
 
             if DEBUG_MODE:
-                logger.debug(f"Looking up {base!r} as {normalized_base!r} (class: {cls.__name__}, module: {cls.__module__})")
+                logger.debug(f"Looking up {name!r} as {normalized_base!r} (class: {cls.__name__}, module: {cls.__module__})")
 
             resolution_container, reg = _lookup_registration(
                 container, name_map, normalized_base, cls.__module__
@@ -426,7 +457,9 @@ def _patch_setattr(cls, container, name_map):
 
             if reg:
                 try:
-                    value = _resolve_via_container(resolution_container, reg)
+                    value = _resolve_via_container(
+                        resolution_container, reg, isinstance(normalized_base, tuple)
+                    )
                     if DEBUG_MODE:
                         impl = (reg.implementation_type or reg.service_type).__name__
                         logger.debug(f"{cls.__name__}.{name} <- {impl} (eager injection)")
@@ -489,11 +522,10 @@ def _patch_init(cls, container, name_map):
             if val is not None:
                 continue
 
-            base = attr[:-len("_instance")]
-            normalized_base = _norm(base)
+            normalized_base = _field_key(attr)
 
             if DEBUG_MODE:
-                logger.debug(f"Post-init lookup: {base!r} as {normalized_base!r} (class: {cls.__name__}, module: {cls.__module__})")
+                logger.debug(f"Post-init lookup: {attr!r} as {normalized_base!r} (class: {cls.__name__}, module: {cls.__module__})")
 
             resolution_container, reg = _lookup_registration(
                 container, name_map, normalized_base, cls.__module__
@@ -1054,8 +1086,15 @@ def print_cache_stats():
 def _validate_autowiring(container, classes):
     # Build a fresh view: validation neither reads nor refreshes the runtime cache.
     registrations = dict(container.registrations)  # snapshot; no nested locks
+    earlier = {st: list(regs) for st, regs in getattr(container, "_earlier", {}).items()}
     name_map = _build_name_map_from_container(container)
     missing = object()
+
+    def targets(regs, name):
+        # A plural field receives every registration of the matched contract.
+        if not name.endswith("_instances"):
+            return regs
+        return [item for reg in regs for item in (*earlier.get(reg.service_type, ()), reg)]
 
     def fields(cls):
         for name in cls.__dict__.get("__di_attrs__", ()):
@@ -1068,7 +1107,7 @@ def _validate_autowiring(container, classes):
 
     def candidates(cls, name):
         unique = {}
-        for reg in name_map.get(_norm(name[:-len("_instance")]), ()):
+        for reg in name_map.get(_field_key(name), ()):
             unique[id(reg)] = reg  # alias/index duplicates are not ambiguity
         regs = list(unique.values())
         primaries = [reg for reg in regs if getattr(reg, "primary", False)]
@@ -1159,7 +1198,8 @@ def _validate_autowiring(container, classes):
                 regs = candidates(impl, name)
                 if regs:
                     selected = _pick_best_registration(regs, impl.__module__)
-                    problems.extend(construction_problems(selected, path, singleton_owner, lifetime_only))
+                    for target in targets([selected], name):
+                        problems.extend(construction_problems(target, path, singleton_owner, lifetime_only))
         return problems
 
     issues = []
@@ -1175,7 +1215,9 @@ def _validate_autowiring(container, classes):
             # still fill it, so it must not fail an otherwise valid startup.
             logger.warning("%s.%s.%s: inherited unannotated field is not injected by "
                            "this class's post-init injection", cls.__module__, cls.__qualname__, name)
-        singleton_owner = next((reg.service_type for reg in registrations.values()
+        singleton_owner = next((reg.service_type for reg in (
+                                    *registrations.values(),
+                                    *(item for items in earlier.values() for item in items))
                                 if reg.scope == LifetimeScope.SINGLETON
                                 and reg.implementation_type is cls), None)
         for name in fields(cls):
@@ -1193,7 +1235,7 @@ def _validate_autowiring(container, classes):
                     for reg in tied
                 )
                 issues.append(f"{label}: ambiguous candidates: {names}")
-            for reg in tied:
+            for reg in targets(tied, name):
                 for problem in construction_problems(reg, singleton_owner=singleton_owner):
                     issues.append(f"{label}: registered but unresolvable: {problem}")
     if issues:

@@ -94,10 +94,19 @@ def bootstrap(application):
 | `register_transient` | `IProductService` → `ProductService` | a new object every time one is needed |
 
 **More than one implementation?** If a contract has two implementations (say
-`MemoryProductRepository` and `SqlProductRepository`), py_autowired does not
-guess: it stops with `AmbiguousImplementationError`. Then name the one to use
-as the second argument:
-`container.register_scoped(IProductRepository, SqlProductRepository)`.
+`MemoryProductRepository` and `SqlProductRepository`), the contract alone is not
+enough: py_autowired does not guess, it stops with
+`AmbiguousImplementationError`. Register each class you want to use:
+
+```python
+container.register_scoped(IProductRepository, MemoryProductRepository)
+container.register_scoped(IProductRepository, SqlProductRepository)
+```
+
+Then `memory_product_repository_instance` and `sql_product_repository_instance`
+receive their own class, `product_repository_instance` receives the last one
+registered, and `product_repository_instances` receives both as a list. See
+*Several implementations of one contract* in the main README.
 
 `ProductController` is not registered: it only *receives* a dependency and you
 create it yourself with `ProductController()`. Register a class when another
@@ -116,6 +125,11 @@ contract prefixes (and the `Impl` suffix) are understood:
 | `AbsProductRepository`, `Abs_ProductRepository` | `product_repository_instance` |
 | `absProductRepository`, `abs_ProductRepository` | `product_repository_instance` |
 | `ProductRepositoryImpl` | `product_repository_instance` |
+
+The field itself may be written in any of these four ways; all receive the
+same object: `product_repository_instance`, `productrepository_instance`,
+`productRepository_instance`, `ProductRepository_instance`. Only the ending is
+fixed: `_instance` (one object) or `_instances` (all implementations as a list).
 
 ## Contracts only: `strict_interfaces=True`
 

@@ -104,11 +104,20 @@ class ServiceRegistration:
     primary: bool = False  # opt-in @Primary for name-matched field candidates
     key: Any = _UNSET  # opt-in keyed service; unkeyed registrations keep _UNSET
     typevar_map: Any = None  # closed open-generic: {TypeVar: concrete type}
+    # Set when a later registration of the same type takes over: the earlier one
+    # stays usable (by class name, resolve_all) under its own scope slot.
+    variant: Any = _UNSET
+    supplied: bool = False  # register_instance: the object belongs to the caller
 
     @property
     def slot(self) -> Any:
-        """Scope-cache / cycle-stack identity: the type, or (type, key) if keyed."""
-        return self.service_type if self.key is _UNSET else (self.service_type, self.key)
+        """Scope-cache / cycle-stack identity: the type, (type, key) if keyed,
+        (type, variant) for an earlier registration kept beside the current one."""
+        if self.key is not _UNSET:
+            return (self.service_type, self.key)
+        if self.variant is not _UNSET:
+            return (self.service_type, self.variant)
+        return self.service_type
 
     @property
     def has_instance(self) -> bool:
@@ -123,6 +132,30 @@ def factory_dependencies(*service_types: Type[Any]):
         return factory
 
     return decorate
+
+
+class _Variant:
+    """Unique slot marker of an earlier registration; prints as its class name."""
+
+    __slots__ = ("label",)
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+
+    def __repr__(self) -> str:
+        return self.label
+
+
+def _same_target(first: ServiceRegistration, second: ServiceRegistration) -> bool:
+    """Both create the same class the same way (re-registration, not a second one)."""
+    return (
+        first.implementation_type is not None
+        and first.implementation_type is second.implementation_type
+        and first.factory is None
+        and second.factory is None
+        and not first.supplied
+        and not second.supplied
+    )
 
 
 def _concrete_subclasses(service_type: Type[Any]) -> list[Type[Any]]:
@@ -444,6 +477,9 @@ class Container:
         # no new lock on the resolution path.
         self._singleton_order: list[Any] = []
         self._keyed: Dict[tuple, ServiceRegistration] = {}
+        # Earlier registrations of a type, in registration order. The current
+        # one stays in ``registrations``; together they are what resolve_all returns.
+        self._earlier: Dict[Type[Any], list[ServiceRegistration]] = {}
         self._open_generics: Dict[Any, tuple] = {}
         self._closed_generics: Dict[Any, ServiceRegistration] = {}
         self._closed = False
@@ -617,9 +653,36 @@ class Container:
                 raise DuplicateServiceRegistrationError(
                     f"Service is already registered: {service_type.__name__}; use replace()"
                 )
+            if policy == "replace":
+                self._earlier.pop(service_type, None)
+            elif exists:
+                self._keep_earlier(self.registrations[service_type], registration)
             self.registrations[service_type] = registration
             self.registration_history.append((policy, service_type))
             return True
+
+    def _keep_earlier(self, previous: ServiceRegistration, registration: ServiceRegistration) -> None:
+        """Keep the registration being taken over, like .NET keeps every Add*.
+
+        The new registration answers resolve()/``x_instance`` as before; the
+        earlier one stays reachable by its class name and through resolve_all().
+        Registering the same class again replaces its earlier entry. An alias
+        (a shared registration of another type) and an interface-only
+        registration that never got an implementation are not kept.
+        """
+        service_type = registration.service_type
+        kept = [item for item in self._earlier.get(service_type, ())
+                if not _same_target(item, registration)]
+        usable = previous.implementation_type is not None or previous.factory is not None
+        if (previous.service_type is service_type and usable
+                and not _same_target(previous, registration)):
+            implementation = previous.implementation_type or service_type
+            previous.variant = _Variant(implementation.__name__)
+            kept.append(previous)
+        if kept:
+            self._earlier[service_type] = kept
+        else:
+            self._earlier.pop(service_type, None)
 
     def _registration(
         self,
@@ -696,6 +759,7 @@ class Container:
                 implementation_type=type(instance),
                 scope=LifetimeScope.SINGLETON,
                 instance=instance,
+                supplied=True,
             )
         )
 
@@ -769,6 +833,13 @@ class Container:
                 registration.implementation_type = self._discovered_implementation(
                     registration.service_type, defer=True
                 )
+                earlier = self._earlier.get(registration.service_type)
+                if earlier and self.registrations.get(registration.service_type) is registration:
+                    kept = [item for item in earlier if not _same_target(item, registration)]
+                    if kept:
+                        self._earlier[registration.service_type] = kept
+                    else:
+                        del self._earlier[registration.service_type]
 
     def _detach_created_singletons(self) -> list[Any]:
         """Host shutdown: forget container-created singletons, stay usable.
@@ -788,6 +859,7 @@ class Container:
                 *self.registrations.values(),
                 *self._keyed.values(),
                 *self._closed_generics.values(),
+                *(item for items in self._earlier.values() for item in items),
             )
             for registration in registrations:
                 if registration.has_instance and id(registration.instance) in created_ids:
@@ -857,6 +929,22 @@ class Container:
         if registration is None:
             raise ServiceNotRegisteredError(f"Service is not registered: {service_type!r}")
         return self._resolve_registration(registration)
+
+    def resolve_all(self, service_type: Type[T]) -> list[T]:
+        """Every registration of ``service_type``, in registration order.
+
+        Like .NET ``GetServices<T>()`` / Spring ``List<T>``: after
+        ``register_scoped(IRepo, MemoryRepo)`` and ``register_scoped(IRepo, SqlRepo)``
+        it returns one MemoryRepo and one SqlRepo, each with its own lifetime.
+        An unregistered type gives an empty list.
+        """
+        current = self.registrations.get(service_type)
+        if current is None:
+            current = self._closed_generic_registration(service_type)
+        registrations = list(self._earlier.get(service_type, ()))
+        if current is not None:
+            registrations.append(current)
+        return [self._resolve_registration(registration) for registration in registrations]
 
     def register_keyed(
         self,
@@ -1115,3 +1203,6 @@ class Scope:
 
     def resolve_keyed(self, service_type: Type[T], key: Any) -> T:
         return self.container.resolve_keyed(service_type, key)
+
+    def resolve_all(self, service_type: Type[T]) -> list[T]:
+        return self.container.resolve_all(service_type)

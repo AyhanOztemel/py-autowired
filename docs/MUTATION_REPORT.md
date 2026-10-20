@@ -135,3 +135,29 @@ keyword-only markers on private helpers, 1 unreachable `relative_to` fallback,
 Not proven (open): the `IndexError` branch when another thread empties the
 late-import queue between the check and the `pop()`, and the two module-name
 orderings for classes imported into another module (also open in 0.5.0).
+
+## 0.5.2 additions
+
+The code changed in 0.5.2 - several registrations per contract (`resolve_all`,
+class-name and plural `*_instances` fields, the earlier-registration slots),
+upper case in field names, and the refactored prefix helper - was mutation
+tested the same way (every changed line of `container.py` and `autowired.py`,
+all operators). Survivors of the first pass got new tests and were run again.
+
+| | Count |
+|---|---:|
+| Mutants generated | 216 |
+| Killed by the tests | 187 (86.6%) |
+| Equivalent, proven | 29 |
+| Not killed, not proven equivalent | 0 |
+| **Kill rate over non-equivalent mutants** | **100%** |
+
+Equivalent: 3 on the `lru_cache` of the field-key helper (size or removal:
+speed only), 14 on prefix length checks (`> 4` vs `>= 4` / `!= 4` / `> 3`: a
+name that starts with the prefix is never shorter, and the prefix alone gives
+an empty key that no field name can produce), 4 on prefix slices one character earlier
+(the extra character is the underscore, which normalization removes), 7
+identity vs equality (classes; registrations, which never compare equal
+because each holds its own lock; the unset marker), and 1 policy comparison
+(`== "replace"` vs `>= "replace"`: the other policies, "register" and
+"fallback", sort before it).
