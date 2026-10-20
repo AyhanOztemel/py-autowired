@@ -3,6 +3,7 @@ name: tests
 on:
   push:
   pull_request:
+  workflow_call:
 
 jobs:
   test:
@@ -20,3 +21,28 @@ jobs:
       - run: python -m pytest -q
       - run: python -m build
       - run: python -m twine check dist/*
+
+  free-threaded:
+    runs-on: ubuntu-latest
+    env:
+      PYTHON_GIL: "0"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14t"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev,examples]"
+      - name: Assert free-threaded Python and run tests without the GIL
+        run: |
+          python -B - <<'PY'
+          import sys
+          import sysconfig
+          import pytest
+
+          assert sysconfig.get_config_var("Py_GIL_DISABLED") == 1
+          assert not sys._is_gil_enabled(), "GIL must be disabled before tests"
+          result = pytest.main(["-q", "-p", "no:cacheprovider"])
+          assert not sys._is_gil_enabled(), "GIL must remain disabled after tests"
+          raise SystemExit(result)
+          PY

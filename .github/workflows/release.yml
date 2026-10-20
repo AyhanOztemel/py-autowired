@@ -20,6 +20,9 @@ permissions:
   contents: read
 
 jobs:
+  compatibility:
+    uses: ./.github/workflows/tests.yml
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -57,7 +60,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [build, compatibility]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment:

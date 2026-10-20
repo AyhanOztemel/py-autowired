@@ -1,0 +1,61 @@
+name: mutation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev,examples]" "mutmut>=3,<4"
+      - name: Run mutation tests for autowired.py and container.py only
+        id: mutation
+        shell: bash
+        run: |
+          mkdir -p mutation-results
+          set +e
+          set -o pipefail
+          mutmut run 2>&1 | tee mutation-results/run.log
+          status=${PIPESTATUS[0]}
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+      - name: Summarize mutation results
+        if: always()
+        shell: bash
+        env:
+          MUTATION_EXIT_CODE: ${{ steps.mutation.outputs.exit_code }}
+        run: |
+          mkdir -p mutation-results
+          mutmut results > mutation-results/results.txt 2>&1 || true
+          {
+            echo '# Mutation test results'
+            echo
+            echo 'Targets: src/py_autowired/autowired.py, src/py_autowired/container.py'
+            echo "mutmut run exit code: ${MUTATION_EXIT_CODE:-not run}"
+            echo
+            echo '```text'
+            cat mutation-results/results.txt
+            echo '```'
+            if [ -f mutation-results/run.log ]; then
+              echo
+              echo '## Final run output'
+              echo '```text'
+              tail -n 30 mutation-results/run.log
+              echo '```'
+            fi
+          } > mutation-results/summary.md
+          cat mutation-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-results
+          path: mutation-results/
