@@ -4,15 +4,22 @@ from importlib.metadata import PackageNotFoundError, version as _version
 
 from .autowired import (
     AutoInjectionResolutionError,
+    AutowiringValidationError,
     activate_container,
     auto_inject,
     get_cache_stats,
     print_cache_stats,
     refresh,
+    validate_autowiring,
 )
 from .container import (
     AmbiguousImplementationError,
     AsyncDisposalRequiredError,
+    AsyncFactoryError,
+    ContainerClosedError,
+    Keyed,
+    Lazy,
+    Provider,
     CircularDependencyError,
     Container,
     DependencyInjectionError,
@@ -35,7 +42,13 @@ except PackageNotFoundError:  # running straight from a source checkout
 __all__ = [
     "AmbiguousImplementationError",
     "AsyncDisposalRequiredError",
+    "AsyncFactoryError",
+    "ContainerClosedError",
+    "Keyed",
+    "Lazy",
+    "Provider",
     "AutoInjectionResolutionError",
+    "AutowiringValidationError",
     "CircularDependencyError",
     "Container",
     "DependencyInjectionError",
@@ -53,4 +66,5 @@ __all__ = [
     "get_cache_stats",
     "print_cache_stats",
     "refresh",
+    "validate_autowiring",
 ]

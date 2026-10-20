@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "py-autowired"
-version = "0.4.0"
+version = "0.5.0"
 description = "Runtime dependency injection through self.x_instance = None"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Ayhan Öztemel" }]
 license = "MIT"
-keywords = ["dependency-injection", "autowiring", "fastapi", "flask", "django"]
+keywords = ["dependency-injection", "autowiring", "fastapi", "ioc", "runtime-injection"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -22,6 +22,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Libraries :: Application Frameworks",
+  "Typing :: Typed",
 ]
 dependencies = []
 
@@ -32,6 +33,7 @@ Documentation = "https://github.com/AyhanOztemel/py-autowired#readme"
 Issues = "https://github.com/AyhanOztemel/py-autowired/issues"
 
 [project.optional-dependencies]
+fastapi = ["fastapi>=0.110"]
 dev = ["build>=1.2", "pytest>=8", "twine>=6"]
 examples = [
   "django>=5.1",
@@ -56,3 +58,17 @@ py_autowired = ["py.typed"]
 testpaths = ["tests"]
 pythonpath = ["src", "."]
 addopts = "-ra"
+
+[tool.mutmut]
+paths_to_mutate = ["src/py_autowired/autowired.py", "src/py_autowired/container.py"]
+tests_dir = ["tests/"]
+also_copy = [
+  "src/py_autowired/__init__.py",
+  "src/py_autowired/fastapi.py",
+  "src/py_autowired/py.typed",
+  "examples/",
+  "README.md",
+  "USAGE_GUIDE_EN.md",
+  "KULLANIM_KILAVUZU_TR.md",
+]
+pytest_add_cli_args = ["-q", "-p", "no:cacheprovider"]

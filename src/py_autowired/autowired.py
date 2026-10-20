@@ -1,8 +1,5 @@
-# py_autowired.py - FIXED Production-Ready Version
 """
-Ultra-optimized auto-injection with full backward compatibility.
-Performance: 10,000+ requests with minimal overhead.
-FIX: Correctly handles nested directory structures.
+Automatic field injection with cached name matching and nested module scanning.
 """
 import re
 import inspect
@@ -11,16 +8,28 @@ import importlib
 import os
 import threading
 import dis
+import logging
+import weakref
 from functools import wraps
 from pathlib import Path
 from collections import defaultdict
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, Any, Tuple
+from typing import Dict, Iterable, List, Optional, Any, Tuple, get_type_hints
+
+from .container import DependencyInjectionError, LifetimeScope, _deferred_wrapper, _keyed_marker, _parameter_hint, _slot_name, _unwrap_annotation
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 DEBUG_MODE = os.getenv("PY_AUTOWIRED_DEBUG", os.getenv("DI_DEBUG", "")).lower() in ("1", "true", "yes")
+logger = logging.getLogger("py_autowired")
+# Only debug mode installs console output. Applications otherwise own logging.
+if not any(getattr(handler, "_py_autowired_handler", False) for handler in logger.handlers):
+    handler = logging.StreamHandler() if DEBUG_MODE else logging.NullHandler()
+    handler._py_autowired_handler = True
+    logger.addHandler(handler)
+if DEBUG_MODE:
+    logger.setLevel(logging.DEBUG)
 # 🆕 v2: Eski davranış (TÜM sınıfları patch'le) için kaçış kapısı.
 #        Varsayılan: sadece '*_instance' adayı olan sınıflar patch'lenir.
 PATCH_ALL_MODE = os.getenv("PY_AUTOWIRED_PATCH_ALL", os.getenv("DI_PATCH_ALL", "")).lower() in ("1", "true", "yes")
@@ -38,8 +47,42 @@ _EXCLUDED_DIRS = {
 _NAME_MAP_CACHE: Optional['_CachedNameMap'] = None
 # 🆕 v2: nogil/free-threaded güvenliği için global kilit
 _GLOBAL_LOCK = threading.RLock()
+_PATCHED_CLASSES = {}
 
-class AutoInjectionResolutionError(RuntimeError):
+
+def _forget_patched_classes(key):
+    with _GLOBAL_LOCK:
+        _PATCHED_CLASSES.pop(key, None)
+
+
+def _remember_patched_class(container, cls):
+    # Identity keys avoid hashing containers or classes with custom metaclasses.
+    with _GLOBAL_LOCK:
+        key = id(container)
+        if key not in _PATCHED_CLASSES:
+            _PATCHED_CLASSES[key] = weakref.WeakValueDictionary()
+            try:
+                weakref.finalize(container, _forget_patched_classes, key)
+            except TypeError:
+                # A non-weakrefable duck-typed container remains supported.
+                # Live class wrappers already hold their container by identity.
+                pass
+        _PATCHED_CLASSES[key][id(cls)] = cls
+
+class AutowiringValidationError(DependencyInjectionError):
+    """All statically detectable field problems from a startup check.
+
+    ``issues`` is an immutable tuple of English diagnostic strings.
+    """
+
+    def __init__(self, issues):
+        self.issues = tuple(issues)
+        super().__init__(
+            "Autowiring validation failed:\n" + "\n".join(f"- {issue}" for issue in self.issues)
+        )
+
+
+class AutoInjectionResolutionError(DependencyInjectionError, RuntimeError):
     """A registered dependency existed but could not be constructed."""
 
 
@@ -80,7 +123,6 @@ def _get_module_depth_info(module_name: str) -> dict:
         'full_name': module_name,
         'parts': parts,
         'depth': len(parts),
-        'package_tree': ['.'.join(parts[:i+1]) for i in range(len(parts))]
     }
 
 
@@ -102,7 +144,7 @@ class _CachedNameMap:
     Internal cache for name map and resolutions.
     Provides massive speedup while maintaining backward compatibility.
     """
-    __slots__ = ('_raw_map', '_resolution_cache', '_container', '_lock')
+    __slots__ = ('_raw_map', '_resolution_cache', '_container', '_lock', '_generation')
 
     def __init__(self, container):
         self._container = container
@@ -110,6 +152,8 @@ class _CachedNameMap:
         self._resolution_cache: Dict[Tuple[str, str], Any] = {}
         # 🆕 v2: nogil güvenliği — lazy init yarışını kapatan kilit
         self._lock = threading.Lock()
+        # Bumped by refresh(); lets lock-free lookups detect a concurrent refresh.
+        self._generation = 0
 
     def get_raw_map(self) -> dict:
         """Get raw name map - built once, reused (🆕 v2: thread-safe)"""
@@ -125,26 +169,30 @@ class _CachedNameMap:
         with self._lock:
             self._raw_map = _build_name_map_from_container(self._container)
             self._resolution_cache.clear()
+            self._generation += 1
 
     def get_cached_registration(self, normalized_name: str, context_module: str) -> Optional[Any]:
         """Get best registration with aggressive caching"""
         cache_key = (normalized_name, context_module)
 
-        # O(1) cache lookup
+        # O(1) cache lookup (lock-free hot path, as in 0.4.0)
         if cache_key in self._resolution_cache:
             return self._resolution_cache[cache_key]
 
-        # Cache miss - calculate and store
+        # Cache miss - calculate and store (still lock-free). The generation is
+        # read BEFORE the map, so a refresh() during the computation is detected.
+        generation = self._generation
         raw_map = self.get_raw_map()
         regs = raw_map.get(normalized_name, [])
-
-        if not regs:
-            # 🆕 v2: setdefault — eşzamanlı yazımda tek deterministik değer
-            return self._resolution_cache.setdefault(cache_key, None)
-
-        best = _pick_best_registration(regs, context_module)
-        return self._resolution_cache.setdefault(cache_key, best)
-
+        best = _pick_best_registration(regs, context_module) if regs else None
+        # 🆕 v2: setdefault — eşzamanlı yazımda tek deterministik değer
+        stored = self._resolution_cache.setdefault(cache_key, best)
+        if self._generation != generation:
+            # A refresh() ran meanwhile: never let a pre-refresh choice persist.
+            if self._resolution_cache.get(cache_key) is best:
+                self._resolution_cache.pop(cache_key, None)
+            return best
+        return stored
 
 def _build_name_map_from_container(container):
     """
@@ -153,7 +201,8 @@ def _build_name_map_from_container(container):
     """
     name_map = defaultdict(list)
 
-    for binding_type, reg in container.registrations.items():
+    # Snapshot copy; no lock here (never nest container and cache locks).
+    for binding_type, reg in list(container.registrations.items()):
         # Aliases share a registration with their target. Index the public
         # binding name so name-based injection can resolve either contract.
         st = binding_type
@@ -198,12 +247,25 @@ def _build_name_map_from_container(container):
                 name_map[generic_key].append(reg)
 
     if DEBUG_MODE:
-        print("\n📋 Name map oluşturuldu:")
+        logger.debug("Name map built:")
         for key, regs in name_map.items():
             types = [r.service_type.__name__ for r in regs]
-            print(f"  '{key}' -> {types}")
+            logger.debug(f"  {key!r} -> {types}")
 
     return name_map
+
+
+def _registration_score(reg, ctx_module: str):
+    """Shared runtime/validation rank; equal scores keep registration order."""
+    if not ctx_module:
+        return (0, 0)
+    impl = reg.implementation_type or reg.service_type
+    module = getattr(impl, "__module__", "")
+    if not module:
+        return (-1, 0)
+    depth = _get_module_depth_info(module)['depth']
+    score = 1000 if module == ctx_module else _calculate_module_similarity(ctx_module, module) * 10 + depth
+    return (score, depth)
 
 
 def _pick_best_registration(regs, ctx_module: str):
@@ -214,34 +276,28 @@ def _pick_best_registration(regs, ctx_module: str):
     if not regs:
         return None
 
+    # Opt-in @Primary: only narrows the candidates when a primary mark exists.
+    primaries = [reg for reg in regs if getattr(reg, "primary", False)]
+    if primaries:
+        regs = primaries
+
     if not ctx_module:
         return regs[0]
 
-    ctx_info = _get_module_depth_info(ctx_module)
     scored_regs = []
 
     for reg in regs:
         it = reg.implementation_type or reg.service_type
         reg_module = getattr(it, "__module__", "")
 
+        score, depth = _registration_score(reg, ctx_module)
+        scored_regs.append((reg, score, depth))
+
         if not reg_module:
-            scored_regs.append((reg, -1, 0))
             continue
 
-        reg_info = _get_module_depth_info(reg_module)
-
-        # Score calculation
-        if reg_module == ctx_module:
-            score = 1000
-        else:
-            common_depth = _calculate_module_similarity(ctx_module, reg_module)
-            module_depth = reg_info['depth']
-            score = common_depth * 10 + module_depth
-
-        scored_regs.append((reg, score, reg_info['depth']))
-
         if DEBUG_MODE:
-            print(f"    📊 {it.__name__} ({reg_module}): skor={score}, ortak_derinlik={_calculate_module_similarity(ctx_module, reg_module)}")
+            logger.debug(f"{it.__name__} ({reg_module}): score={score}, common_depth={_calculate_module_similarity(ctx_module, reg_module)}")
 
     # Sort by score
     scored_regs.sort(key=lambda x: (x[1], x[2]), reverse=True)
@@ -250,7 +306,7 @@ def _pick_best_registration(regs, ctx_module: str):
 
     if DEBUG_MODE:
         selected_type = selected.implementation_type or selected.service_type
-        print(f"    ✨ Seçilen: {selected_type.__name__} (modül: {getattr(selected_type, '__module__', 'unknown')})")
+        logger.debug(f"Selected: {selected_type.__name__} (module: {getattr(selected_type, '__module__', 'unknown')})")
 
     return selected
 
@@ -288,7 +344,7 @@ def _find_di_candidates(cls) -> tuple:
     """
     🆕 v2: Sınıfın '*_instance' DI adaylarını PATCH ANINDA bir kez tespit et.
     Kaynaklar:
-      1. Sınıf gövdesindeki attribute'lar   (apart_service_instance = None)
+      1. Sınıf gövdesindeki attribute'lar   (order_service_instance = None)
       2. Annotation'lar                     (svc_instance: ABS_Service = None)
       3. Metod gövdelerindeki attribute
          isimleri (co_names)                (self.repo_instance = None)
@@ -349,7 +405,7 @@ def _patch_setattr(cls, container, name_map):
             normalized_base = _norm(base)
 
             if DEBUG_MODE:
-                print(f"  🔎 Aranan: '{base}' -> normalized: '{normalized_base}' (sınıf: {cls.__name__}, modül: {cls.__module__})")
+                logger.debug(f"Looking up {base!r} as {normalized_base!r} (class: {cls.__name__}, module: {cls.__module__})")
 
             resolution_container, reg = _lookup_registration(
                 container, name_map, normalized_base, cls.__module__
@@ -360,10 +416,10 @@ def _patch_setattr(cls, container, name_map):
                     value = _resolve_via_container(resolution_container, reg)
                     if DEBUG_MODE:
                         impl = (reg.implementation_type or reg.service_type).__name__
-                        print(f"    ⚡ {cls.__name__}.{name} ← {impl} (eager injection)")
+                        logger.debug(f"{cls.__name__}.{name} <- {impl} (eager injection)")
                 except Exception as e:
                     if DEBUG_MODE:
-                        print(f"    ⚠️ Injection hatası: {e}")
+                        logger.debug(f"Injection failed: {e}")
                     raise AutoInjectionResolutionError(
                         f"{cls.__module__}.{cls.__name__}.{name}: "
                         f"{reg.service_type.__name__} could not be resolved"
@@ -381,6 +437,10 @@ def _patch_init(cls, container, name_map):
     Post-init injection for remaining None attributes.
     """
     # 🆕 v2 FIX: getattr yerine cls.__dict__ — kalıtım bug'ı düzeltmesi
+    try:
+        _remember_patched_class(container, cls)
+    except Exception as exc:  # opt-in validation bookkeeping must never break patching
+        logger.debug(f"Validation tracking skipped for {cls!r}: {exc}")
     if cls.__dict__.get("__ai_ioc_init__", False):
         return
 
@@ -407,6 +467,10 @@ def _patch_init(cls, container, name_map):
             try:
                 val = getattr(self, attr)
             except Exception:
+                logger.warning(
+                    "Field read failed for %s.%s.%s; field skipped",
+                    cls.__module__, cls.__qualname__, attr, exc_info=True,
+                )
                 continue
 
             if val is not None:
@@ -416,7 +480,7 @@ def _patch_init(cls, container, name_map):
             normalized_base = _norm(base)
 
             if DEBUG_MODE:
-                print(f"  🔎 Post-init aranan: '{base}' -> normalized: '{normalized_base}' (sınıf: {cls.__name__}, modül: {cls.__module__})")
+                logger.debug(f"Post-init lookup: {base!r} as {normalized_base!r} (class: {cls.__name__}, module: {cls.__module__})")
 
             resolution_container, reg = _lookup_registration(
                 container, name_map, normalized_base, cls.__module__
@@ -424,7 +488,7 @@ def _patch_init(cls, container, name_map):
 
             if not reg:
                 if DEBUG_MODE:
-                    print(f"    ❌ '{normalized_base}' için kayıt bulunamadı")
+                    logger.debug(f"No registration found for {normalized_base!r}")
                 continue
 
             try:
@@ -432,10 +496,10 @@ def _patch_init(cls, container, name_map):
                 setattr(self, attr, injected)
                 if DEBUG_MODE:
                     impl = (reg.implementation_type or reg.service_type).__name__
-                    print(f"    💉 {cls.__name__}.{attr} ← {impl} (post-init injection)")
+                    logger.debug(f"{cls.__name__}.{attr} <- {impl} (post-init injection)")
             except Exception as e:
                 if DEBUG_MODE:
-                    print(f"    ⚠️ Post-init injection hatası: {e}")
+                    logger.debug(f"Post-init injection failed: {e}")
                 raise AutoInjectionResolutionError(
                     f"{cls.__module__}.{cls.__name__}.{attr}: "
                     f"{reg.service_type.__name__} could not be resolved"
@@ -475,7 +539,7 @@ def _find_project_root() -> Path:
         current = Path.cwd()
 
     if DEBUG_MODE:
-        print(f"🔍 Başlangıç dizini: {current}")
+        logger.debug(f"Starting directory: {current}")
 
     # Common project root markers
     markers = [
@@ -497,7 +561,7 @@ def _find_project_root() -> Path:
         for marker in markers:
             if (parent / marker).exists():
                 if DEBUG_MODE:
-                    print(f"✅ Proje kökü bulundu: {parent} (marker: {marker})")
+                    logger.debug(f"Project root found: {parent} (marker: {marker})")
                 return parent
 
         # Don't go beyond home directory or root
@@ -506,8 +570,8 @@ def _find_project_root() -> Path:
 
     # If no markers found, use the starting directory
     if DEBUG_MODE:
-        print(f"⚠️ Marker bulunamadı, başlangıç dizini kullanılıyor: {current}")
-        print(f"   Kontrol edilen dizinler: {checked_dirs[:3]}")
+        logger.debug(f"No project marker found; using starting directory: {current}")
+        logger.debug(f"Directories checked: {checked_dirs[:3]}")
 
     return current
 
@@ -515,15 +579,20 @@ def _find_project_root() -> Path:
 def _import_module_safely(dotted_name: str, file_path: str) -> bool:
     """ORIGINAL FUNCTION - unchanged"""
     try:
-        importlib.import_module(dotted_name)
+        module = importlib.import_module(dotted_name)
+        actual = getattr(module, "__file__", None)
+        if not actual or Path(actual).resolve() != Path(file_path).resolve():
+            logger.warning(
+                "Module origin mismatch for %s: expected %s, imported %s",
+                dotted_name, Path(file_path).resolve(), actual,
+            )
+            return False
         return True
     except ImportError as e:
-        if DEBUG_MODE:
-            print(f"    ⚠️ Import hatası ({dotted_name}): {e}")
+        logger.warning(f"Import failed for {dotted_name}: {e}")
         return False
     except Exception as e:
-        if DEBUG_MODE:
-            print(f"    ❌ Beklenmeyen hata ({dotted_name}): {e}")
+        logger.warning(f"Import failed for {dotted_name}: {e}")
         return False
 
 
@@ -543,8 +612,8 @@ def _discover_and_load_modules(root: Path, exclude_dirs: Optional[Iterable[str]]
     excluded_dirs = _normalize_excluded_dirs(exclude_dirs)
 
     if DEBUG_MODE:
-        print("\n📂 Modül keşfi başlatılıyor...")
-        print(f"   Kök dizin: {root}")
+        logger.debug("Starting module discovery")
+        logger.debug(f"Root directory: {root}")
 
     main_mod = sys.modules.get("__main__")
     main_path = Path(getattr(main_mod, "__file__", "")).resolve() if (main_mod and getattr(main_mod, "__file__", None)) else None
@@ -583,32 +652,32 @@ def _discover_and_load_modules(root: Path, exclude_dirs: Optional[Iterable[str]]
             dotted = ".".join(rel.with_suffix("").parts)
 
             if DEBUG_MODE:
-                print(f"  📄 Yükleniyor: {dotted} ({rel})")
+                logger.debug(f"Loading: {dotted} ({rel})")
 
             if _import_module_safely(dotted, str(p)):
                 loaded += 1
                 if DEBUG_MODE:
-                    print(f"    ✅ Başarılı")
+                    logger.debug("Module loaded")
             else:
                 skipped.append((dotted, "import failed"))
 
         except ValueError as e:
             # File is not relative to root
             if DEBUG_MODE:
-                print(f"    ⚠️ Dosya kök dizin dışında: {p}")
+                logger.debug(f"File outside root directory: {p}")
             skipped.append((str(p), "outside root"))
         except Exception as e:
             if DEBUG_MODE:
-                print(f"    ❌ Modül yolu hatası ({p}): {e}")
+                logger.debug(f"Module path error ({p}): {e}")
             skipped.append((str(p), f"error: {e}"))
 
     if DEBUG_MODE:
-        print(f"\n📊 Modül yükleme özeti:")
-        print(f"   ✅ Başarılı: {loaded}/{total_files}")
-        print(f"   ⏭️  Atlanan: {len(skipped)} dosya")
+        logger.debug("Module loading summary:")
+        logger.debug(f"Loaded: {loaded}/{total_files}")
+        logger.debug(f"Skipped: {len(skipped)} files")
         if skipped and len(skipped) <= 5:
             for name, reason in skipped[:5]:
-                print(f"      - {name}: {reason}")
+                logger.debug(f"  {name}: {reason}")
 
     return loaded
 
@@ -633,6 +702,7 @@ def auto_inject(
     root_dir: str | None = None,
     *,
     exclude_dirs: Optional[Iterable[str]] = None,
+    validate: bool = False,
 ):
     """
     🔧 FIXED VERSION - Now correctly handles nested structures!
@@ -646,12 +716,14 @@ def auto_inject(
 
         exclude_dirs: Additional directory names that discovery must skip.
             Built-in safety exclusions remain active.
+        validate: Inspect patched fields without constructing services and raise
+            one AutowiringValidationError containing all static problems.
     Returns:
         Number of patched classes
     """
     if DEBUG_MODE:
-        print("\n🚀 Auto injection başlatılıyor (Sınırsız Derinlik)...")
-        print("=" * 60)
+        logger.debug("Starting automatic injection")
+        logger.debug("=" * 60)
 
     # 🔧 FIX: Use project root finder instead of __file__
     if root_dir is None:
@@ -663,8 +735,8 @@ def auto_inject(
         sys.path.insert(0, str(root))
 
     if DEBUG_MODE:
-        print(f"🏠 Kök dizin: {root}")
-        print(f"📍 sys.path[0]: {sys.path[0]}")
+        logger.debug(f"Root directory: {root}")
+        logger.debug(f"sys.path[0]: {sys.path[0]}")
 
     # Load modules
     if exclude_dirs is None:
@@ -673,13 +745,13 @@ def auto_inject(
         loaded_count = _discover_and_load_modules(root, exclude_dirs)
 
     if loaded_count == 0 and DEBUG_MODE:
-        print("\n⚠️ UYARI: Hiç modül yüklenemedi!")
-        print("   Olası nedenler:")
-        print("   1. Kök dizin yanlış tespit edildi")
-        print("   2. Python dosyaları bulunamadı")
-        print("   3. Tüm import'lar başarısız oldu")
-        print(f"   Lütfen root_dir parametresini manuel olarak belirtin:")
-        print(f"   auto_inject(container, root_dir='/tam/yol/proje/dizinine')")
+        logger.debug("No modules could be loaded")
+        logger.debug("Possible causes:")
+        logger.debug("1. Incorrect project root")
+        logger.debug("2. No Python files found")
+        logger.debug("3. All imports failed")
+        logger.debug("Set root_dir explicitly:")
+        logger.debug("auto_inject(container, root_dir='/absolute/path/to/project')")
 
     # Build cached name map
     global _NAME_MAP_CACHE
@@ -688,7 +760,7 @@ def auto_inject(
 
     # Patch classes
     if DEBUG_MODE:
-        print("\n🔧 Sınıf patch'leme işlemi...")
+        logger.debug("Patching classes")
 
     patched = 0
 
@@ -705,7 +777,7 @@ def auto_inject(
 
         if DEBUG_MODE:
             mod_info = _get_module_depth_info(mod_name)
-            print(f"  📦 Modül: {mod_name} (derinlik: {mod_info['depth']})")
+            logger.debug(f"Module: {mod_name} (depth: {mod_info['depth']})")
 
         for cls_name, cls in inspect.getmembers(mod, inspect.isclass):
             if getattr(cls, "__module__", None) != mod.__name__:
@@ -724,8 +796,14 @@ def auto_inject(
                     except (TypeError, AttributeError):
                         pass  # bazı exotic tipler attribute kabul etmez
                 if not candidates:
+                    # Include skipped classes in opt-in diagnostics without
+                    # installing any new injection wrapper or field candidate.
+                    try:
+                        _remember_patched_class(container, cls)
+                    except Exception:  # bookkeeping must never break patching
+                        pass
                     if DEBUG_MODE:
-                        print(f"    ⏭️  {cls.__name__} atlandı (DI adayı yok)")
+                        logger.debug(f"Skipped {cls.__name__} (no injection candidates)")
                     continue
 
             _patch_setattr(cls, container, name_map)
@@ -733,14 +811,30 @@ def auto_inject(
             patched += 1
 
             if DEBUG_MODE:
-                print(f"    ✅ {cls.__name__} sınıfı patch'lendi")
+                logger.debug(f"Patched {cls.__name__}")
 
     if DEBUG_MODE:
-        print(f"\n✨ İşlem tamamlandı!")
-        print(f"📊 Sonuç: {loaded_count} modül yüklendi, {patched} sınıf patch'lendi.")
-        print("=" * 60 + "\n")
+        logger.debug("Autowiring complete")
+        logger.debug(f"Loaded {loaded_count} modules; patched {patched} classes")
+        logger.debug("=" * 60)
 
+    if validate:
+        validate_autowiring(container)
     return patched
+
+
+def validate_autowiring(container) -> None:
+    """Startup checks for this container's patched classes.
+
+    The check does not construct objects/services, call factories or field
+    descriptors, or open scopes. It may evaluate type annotations, which can
+    execute user code. It cannot predict arbitrary constructor/factory behavior.
+    """
+    with _GLOBAL_LOCK:
+        classes = tuple(_PATCHED_CLASSES.get(id(container), {}).values())
+    # Run outside the global lock: validation may evaluate annotations (imports)
+    # and log; neither must happen while patching/refresh could be waiting.
+    _validate_autowiring(container, classes)
 
 
 # ============================================================================
@@ -765,7 +859,7 @@ def refresh():
         if _NAME_MAP_CACHE is not None:
             _NAME_MAP_CACHE.refresh()
             if DEBUG_MODE:
-                print("🔄 Name map yenilendi, çözümleme cache'i temizlendi")
+                logger.debug("Name map refreshed; resolution cache cleared")
             return True
     return False
 
@@ -804,3 +898,155 @@ def print_cache_stats():
     print(f"  _norm: hits={stats['norm_cache']['hits']}, misses={stats['norm_cache']['misses']}")
     print(f"  _calculate_module_similarity: hits={stats['similarity_cache']['hits']}, misses={stats['similarity_cache']['misses']}")
     print(f"  Resolution cache entries: {stats['resolution_cache_size']}")
+
+
+
+# Opt-in static analysis; deliberately outside the runtime resolution path.
+
+def _validate_autowiring(container, classes):
+    # Build a fresh view: validation neither reads nor refreshes the runtime cache.
+    registrations = dict(container.registrations)  # snapshot; no nested locks
+    name_map = _build_name_map_from_container(container)
+    missing = object()
+
+    def fields(cls):
+        for name in cls.__dict__.get("__di_attrs__", ()):
+            value = inspect.getattr_static(cls, name, missing)
+            # A concrete class-level override is already satisfied. Do not invoke
+            # descriptors; constructor assignments cannot be known statically.
+            if value is not missing and value is not None and not inspect.isdatadescriptor(value):
+                continue
+            yield name
+
+    def candidates(cls, name):
+        unique = {}
+        for reg in name_map.get(_norm(name[:-len("_instance")]), ()):
+            unique[id(reg)] = reg  # alias/index duplicates are not ambiguity
+        regs = list(unique.values())
+        primaries = [reg for reg in regs if getattr(reg, "primary", False)]
+        return primaries or regs  # same narrowing as runtime selection
+
+    def construction_problems(reg, path=(), singleton_owner=None, lifetime_only=False):
+        service = reg.service_type
+        if reg.scope == LifetimeScope.SINGLETON:
+            singleton_owner = singleton_owner or service
+            lifetime_only = lifetime_only or reg.has_instance
+        if reg.scope == LifetimeScope.SCOPED and singleton_owner is not None:
+            return [f"singleton {singleton_owner.__name__} captures scoped {service.__name__}"]
+        ident = getattr(reg, "slot", service)  # (type, key) for keyed registrations
+        if ident in path:
+            if lifetime_only:
+                return []
+            return ["circular dependency: " + " -> ".join(_slot_name(t) for t in path + (ident,))]
+        path = path + (ident,)
+        if reg.factory is not None:
+            problems = []
+            # Factory bodies remain opaque; only explicit metadata can be read.
+            for dependency in getattr(reg.factory, "__di_dependencies__", ()):
+                child = registrations.get(dependency)
+                if child is None and not lifetime_only:
+                    problems.append(f"factory requires unregistered {dependency!r}")
+                elif child is not None:
+                    problems.extend(construction_problems(child, path, singleton_owner, lifetime_only))
+            return problems
+        impl = reg.implementation_type
+        if impl is None:
+            return [] if lifetime_only else [f"{service.__name__} has no implementation"]
+        if inspect.isabstract(impl) and not lifetime_only:
+            return [f"{impl.__name__} is abstract"]
+        try:
+            signature = inspect.signature(impl.__init__)
+        except (TypeError, ValueError):
+            # An opaque callable is unknown, not proof of a broken graph.
+            return []
+        parameters = [p for p in list(signature.parameters.values())[1:] if p.kind not in {
+            inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD,
+        }]
+        problems = []
+        # Mirror the container's existing no-argument field-injection shortcut.
+        if not (getattr(impl, "__di_attrs__", ()) and all(
+            p.default is not inspect.Parameter.empty for p in parameters
+        )):
+            try:
+                hints = get_type_hints(impl.__init__)
+            except (NameError, TypeError, ValueError):
+                hints = {}
+            try:
+                extras = get_type_hints(impl.__init__, include_extras=True)
+            except (NameError, TypeError, ValueError):
+                extras = {}
+            keyed_registrations = getattr(container, "_keyed", {})
+            for parameter in parameters:
+                keyed = _keyed_marker(extras.get(parameter.name, parameter.annotation))
+                if keyed is not None:
+                    child = keyed_registrations.get(keyed)
+                    if child is not None:
+                        problems.extend(construction_problems(child, path, singleton_owner, lifetime_only))
+                    elif not lifetime_only and parameter.default is inspect.Parameter.empty:
+                        problems.append(f"{impl.__name__}.{parameter.name} requires unregistered keyed {keyed!r}")
+                    continue
+                annotation = _unwrap_annotation(_parameter_hint(parameter, hints))
+                deferred = _deferred_wrapper(annotation)
+                if deferred is not None:
+                    # Provider[X]/Lazy[X] defer resolution: never a capture,
+                    # only the inner registration must exist.
+                    if not lifetime_only and deferred[1] not in registrations:
+                        problems.append(f"{impl.__name__}.{parameter.name} defers an unregistered dependency ({deferred[1]!r})")
+                    continue
+                child = registrations.get(annotation)
+                if child is None and hasattr(container, "_closed_generic_registration"):
+                    child = container._closed_generic_registration(annotation, cache=False)
+                if annotation is not inspect.Parameter.empty and child is not None:
+                    problems.extend(construction_problems(child, path, singleton_owner, lifetime_only))
+                elif (not lifetime_only and annotation is inspect.Parameter.empty
+                      and parameter.default is inspect.Parameter.empty):
+                    problems.append(f"{impl.__name__}.{parameter.name} needs a type annotation or default")
+                elif (parameter.default is inspect.Parameter.empty
+                      and not lifetime_only
+                      and annotation is not inspect.Parameter.empty
+                      and not isinstance(annotation, str)):
+                    problems.append(f"{impl.__name__}.{parameter.name} requires an unregistered dependency ({annotation!r})")
+        if impl.__dict__.get("__ai_ioc_init__", False):
+            for name in fields(impl):
+                regs = candidates(impl, name)
+                if regs:
+                    selected = _pick_best_registration(regs, impl.__module__)
+                    problems.extend(construction_problems(selected, path, singleton_owner, lifetime_only))
+        return problems
+
+    issues = []
+    for cls in sorted(classes, key=lambda c: (c.__module__, c.__qualname__)):
+        own_candidates = set(cls.__dict__.get("__di_attrs__", ()))
+        inherited = set()
+        for base in cls.__mro__[1:]:
+            inherited.update(name for name, value in base.__dict__.items()
+                             if _DEF_ATTR_RE.match(name) and value is None
+                             and name not in own_candidates)
+        for name in sorted(inherited):
+            # Informational only: a base constructor or explicit assignment may
+            # still fill it, so it must not fail an otherwise valid startup.
+            logger.warning("%s.%s.%s: inherited unannotated field is not injected by "
+                           "this class's post-init injection", cls.__module__, cls.__qualname__, name)
+        singleton_owner = next((reg.service_type for reg in registrations.values()
+                                if reg.scope == LifetimeScope.SINGLETON
+                                and reg.implementation_type is cls), None)
+        for name in fields(cls):
+            label = f"{cls.__module__}.{cls.__qualname__}.{name}"
+            regs = candidates(cls, name)
+            if not regs:
+                issues.append(f"{label}: no matching registration")
+                continue
+            best = max(_registration_score(reg, cls.__module__) for reg in regs)
+            tied = [reg for reg in regs if _registration_score(reg, cls.__module__) == best]
+            if len(tied) > 1:
+                names = ", ".join(
+                    f"{(reg.implementation_type or reg.service_type).__module__}."
+                    f"{(reg.implementation_type or reg.service_type).__qualname__}"
+                    for reg in tied
+                )
+                issues.append(f"{label}: ambiguous candidates: {names}")
+            for reg in tied:
+                for problem in construction_problems(reg, singleton_owner=singleton_owner):
+                    issues.append(f"{label}: registered but unresolvable: {problem}")
+    if issues:
+        raise AutowiringValidationError(issues)
