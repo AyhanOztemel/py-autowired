@@ -31,7 +31,7 @@ def _run(arguments):
 def test_runtime_package_stays_minimal():
     package = ROOT / "src" / "py_autowired"
     files = sorted(path.name for path in package.glob("*.py"))
-    assert files == ["__init__.py", "autowired.py", "container.py"]
+    assert files == ["__init__.py", "autowired.py", "container.py", "fastapi.py"]
     assert (package / "py.typed").is_file()
 
 
@@ -61,9 +61,12 @@ def test_console_direct_source_run_needs_no_pythonpath_src():
             "from fastapi.testclient import TestClient;"
             "from examples.fastapi_app.app import app;"
             "client=TestClient(app);client.__enter__();"
-            "home=client.get('/');assert home.status_code==200;assert '/di-demo/Ayhan' in home.text;response=client.get('/di-demo/FastAPI');legacy=client.get('/hello/FastAPI');assert legacy.status_code==200;"
+            "home=client.get('/');assert home.status_code==200;assert '/di-demo/World' in home.text;response=client.get('/di-demo/FastAPI');legacy=client.get('/hello/FastAPI');assert legacy.status_code==200;"
             "assert response.status_code==200;"
             "assert 'FastAPI' in response.json()['message'];assert len(response.json()['injection_trace'])==5;assert max(step['module_depth'] for step in response.json()['injection_trace'])>=8;"
+            "optional=client.get('/di-demo-depends/FastAPI');assert optional.status_code==200;"
+            "assert optional.json()['message']==response.json()['message'];"
+            "assert len(optional.json()['injection_trace'])==5;assert max(step['module_depth'] for step in optional.json()['injection_trace'])>=8;"
             "client.__exit__(None,None,None)",
         ),
         (
