@@ -16,7 +16,8 @@ class ProductService:
 py_autowired fills `product_repository_instance` at runtime. `ProductService`
 does not import the repository, does not receive it as a constructor argument,
 and does not call any container. The classes stay independent of each other.
-The only place that imports them is one `register/` folder.
+One `register/` folder lists the contracts they need; py_autowired finds the
+class behind each contract by itself.
 
 Türkçe: [KULLANIM_KILAVUZU_TR.md](KULLANIM_KILAVUZU_TR.md)
 
@@ -52,19 +53,18 @@ class ProductController:
         return self.product_service_instance.list_products()
 ```
 
-**2. `register/register.py`** - the only file that imports the classes; it
-says which class serves each need and how long it lives:
+**2. `register/register.py`** - lists the contracts and how long each object
+lives. It names no implementation class: py_autowired finds the single class
+that implements each contract:
 
 ```python
-from application.product_service import ProductService
 from domain.product_repository import IProductRepository
 from domain.product_service import IProductService
-from infrastructure.memory_product_repository import MemoryProductRepository
 
 
 def register(container):
-    container.register_scoped(IProductRepository, MemoryProductRepository)
-    container.register_transient(IProductService, ProductService)
+    container.register_scoped(IProductRepository)    # finds MemoryProductRepository
+    container.register_transient(IProductService)    # finds ProductService
 ```
 
 **3. `bootstrap/bootstrap.py`** - how the application comes up:
@@ -140,21 +140,24 @@ follows), so names such as `Absolute` or `Ignore...` stay ordinary words.
 
 | Call | Lifetime | Use it for |
 | --- | --- | --- |
-| `container.register_singleton(IClock, SystemClock)` | one object for the whole application | configuration, clocks, clients that are safe to share |
+| `container.register_singleton(IClock)` | one object for the whole application | configuration, clocks, clients that are safe to share |
 | `container.register_scoped(IRepo, SqlRepo)` | one object per scope (a web request) | database sessions, unit of work |
-| `container.register_transient(IProductService, ProductService)` | a new object every time | stateless services |
+| `container.register_transient(IProductService)` | a new object every time | stateless services |
 | `container.register_instance(Settings, settings)` | the object you give | objects you created yourself; never closed by py_autowired |
 
-- `register_*(Contract, Implementation)` - the clearest form.
-- `register_*(Contract)` - py_autowired finds the single implementation of the
-  contract by itself, also when it lives in another layer.
+- `register_*(Contract)` - the form used in every example: py_autowired finds
+  the single implementation of the contract by itself, also when it lives in
+  another layer.
+- `register_*(Contract, Implementation)` - needed when a contract has more than
+  one implementation. Without it py_autowired does not guess; it stops with
+  `AmbiguousImplementationError`.
 - `register_*(ConcreteClass)` - the class is its own implementation. Not allowed
   with `Container(strict_interfaces=True)`.
 - **Contracts only:** `Container(strict_interfaces=True)` (used in every example)
   accepts only interfaces / abstract classes as the registered type. Then every
   dependency in the project points to an abstraction, never to a concrete class.
-- Keep the `register_*` lines in `register/` - the one place that imports the
-  application classes.
+- Keep the `register_*` lines in `register/`. Then no file imports an
+  implementation class: imports point only to the contracts.
 - Register a class when **another class needs it**. A class that only receives
   dependencies (a controller) is created normally: `ProductController()`.
 - Scoped objects with a `close()`/`dispose()` (or `aclose()`) method are closed

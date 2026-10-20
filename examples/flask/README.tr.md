@@ -19,8 +19,10 @@ Sonra http://127.0.0.1:8002/products adresini açın.
    hangi sözleşmenin kastedildiğini söyler: `product_service_instance` bir
    `IProductService`, `product_repository_instance` bir `IProductRepository`.
    Alanlar çalışma anında kendiliğinden dolar.
-2. **Import yalnız `register/` içinde yapılır.** Her ihtiyaç için hangi
-   sınıfın oluşturulacağı ve her nesnenin ne kadar yaşayacağı burada yazılır.
+2. **`register/` yalnız sözleşmeleri yazar.** Uygulamanın kullandığı
+   sözleşmeler ve her nesnenin ne kadar yaşayacağı burada yazılır. Her
+   sözleşmeyi uygulayan sınıfı py_autowired kendisi bulur; hiçbir uygulama
+   sınıfı hiçbir yerde import edilmez.
 3. **`bootstrap/` uygulamayı ayağa kaldırır:** container'ı oluşturur, kayıtları
    ekler ve Flask'a bağlar. Giriş dosyanız onu bir kez çağırır:
    `bootstrap(app)`.
@@ -40,33 +42,31 @@ application/            # iş mantığı
 presentation/           # kullanıcının çağırdığı yer
   product_controller.py # IProductService'e ihtiyaç duyar - hiçbir şey import etmez
   routes.py             # HTTP uç noktaları (Blueprint)
-register/               # SINIFLARI IMPORT EDEN TEK YER
-  register.py           # hangi sınıf, ne kadar yaşar
+register/               # hangi sözleşmeler kullanılır - uygulama sınıfı yazmaz
+  register.py           # sözleşme + ne kadar yaşar
 bootstrap/              # uygulama nasıl ayağa kalkar
   bootstrap.py          # container + kayıtlar + Flask köprüsü
 app.py                  # uygulamayı kurar ve bootstrap(app) çağırır
 requirements.txt        # proje kökünü de belirtir
 ```
 
-Katmanlar arasındaki tek başka import: bir uygulama sınıfı, uyguladığı
-sözleşmeyi import eder (`MemoryProductRepository(IProductRepository)`,
-`ProductService(IProductService)`).
+Katmanlar arasındaki import'lar yalnız `domain/`'e gider: bir uygulama sınıfı
+uyguladığı sözleşmeyi import eder (`MemoryProductRepository(IProductRepository)`,
+`ProductService(IProductService)`), `register/` de sözleşmeleri import eder.
+`infrastructure/` ya da `application/` klasörünü kimse import etmez.
 
 ## register/register.py
 
 ```python
-from application.product_service import ProductService
 from domain.clock import IClock
 from domain.product_repository import IProductRepository
 from domain.product_service import IProductService
-from infrastructure.memory_product_repository import MemoryProductRepository
-from infrastructure.system_clock import SystemClock
 
 
 def register(container):
-    container.register_singleton(IClock, SystemClock)
-    container.register_scoped(IProductRepository, MemoryProductRepository)
-    container.register_transient(IProductService, ProductService)
+    container.register_singleton(IClock)
+    container.register_scoped(IProductRepository)
+    container.register_transient(IProductService)
 ```
 
 ## bootstrap/bootstrap.py
@@ -84,11 +84,17 @@ def bootstrap(app):
     attach_container(app, container)   # scan on the first request, scope per request, close at exit
 ```
 
-| Yaşam süresi | Bu örnekte | Anlamı |
+| Yaşam süresi | Kaydedilen sözleşme → kendiliğinden bulunan sınıf | Anlamı |
 | --- | --- | --- |
 | `register_singleton` | `IClock` → `SystemClock` | bütün uygulama için tek nesne |
 | `register_scoped` | `IProductRepository` → `MemoryProductRepository` | HTTP isteği başına bir nesne; sonunda `close()` çağrılır |
 | `register_transient` | `IProductService` → `ProductService` | her ihtiyaçta yeni bir nesne |
+
+**Birden çok uygulama mı var?** Bir sözleşmenin iki uygulaması varsa (örneğin
+`MemoryProductRepository` ve `SqlProductRepository`) py_autowired tahmin
+yürütmez, `AmbiguousImplementationError` hatasıyla durur. O zaman kullanılacak
+sınıfı ikinci argüman olarak yazın:
+`container.register_scoped(IProductRepository, SqlProductRepository)`.
 
 `ProductController` kaydedilmez: yalnız bağımlılık *alır*, onu siz
 `ProductController()` diye oluşturursunuz. Başka bir sınıfın ihtiyaç duyduğu
@@ -111,9 +117,9 @@ karşılaştırılır. Alt çizgi ve büyük/küçük harf fark etmez; şu sözl
 ## Yalnız sözleşme: `strict_interfaces=True`
 
 `bootstrap/` içindeki container `Container(strict_interfaces=True)` ile
-oluşturulur: yalnız bir sözleşme (arayüz / abstract class) kaydedilebilir, her
-zaman uygulamasıyla birlikte. Böylece projedeki her bağımlılık somut bir sınıfa
-değil, bir soyutlamaya bağlanır.
+oluşturulur: yalnız bir sözleşme (arayüz / abstract class) kaydedilebilir,
+somut sınıf kaydedilemez. Böylece projedeki her bağımlılık bir soyutlamaya
+bağlanır.
 
 ## Köprü
 
@@ -123,13 +129,10 @@ değil, bir soyutlamaya bağlanır.
 
 1. Sınıflarınızı `*_instance = None` alanlarıyla yazın; birbirine import etmeyin.
 2. `register/` ve `bootstrap/` klasörlerini kopyalayın; `register/register.py`
-   içindeki import'ları ve `register_*` satırlarını değiştirin.
+   içinde kendi sözleşmelerinizi import edip her sözleşme için bir
+   `register_*` satırı yazın.
 3. `app.py` dosyasındaki gibi `bootstrap(...)`'ı bir kez çağırın.
 
-İsterseniz yalnız arayüzü de kaydedebilirsiniz, örneğin
-`container.register_scoped(IProductRepository)`: py_autowired tek uygulamasını
-kendisi bulur. Sınıfı yukarıdaki gibi açıkça yazmak her şeyi tek yerde
-görünür tutar.
 
 İsteğe bağlı özellikler (açılışta doğrulama, `Provider`/`Lazy`, anahtarlı
 servisler, generic'ler, ...) ana README'de *İsteğe bağlı özellikler*

@@ -1,10 +1,12 @@
 """The four examples are self-contained projects; each runs in its own process.
 
-Every example has the same layers and a register/ folder that is the only place
-importing the application classes. Consumers declare ``self.x_instance = None``.
+Every example has the same layers and a register/ folder that names only the
+contracts; the implementations are found automatically. Consumers declare
+``self.x_instance = None``.
 """
 
 from pathlib import Path
+import ast
 import importlib.util
 import os
 import subprocess
@@ -78,6 +80,15 @@ def test_every_example_is_complete_and_self_contained(example):
         imports = [s for s in statements if s.startswith(("import ", "from "))]
         assert all(s.startswith(allowed) for s in imports) if allowed else not imports, (rel, imports)
         assert "_instance = None" in text, rel
+    # register/ names contracts only; the implementations are found automatically.
+    tree = ast.parse((base / "register" / "register.py").read_text(encoding="utf-8"))
+    imports = [node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))]
+    assert imports and all(isinstance(node, ast.ImportFrom) and node.module.startswith("domain.")
+                           for node in imports), [ast.unparse(node) for node in imports]
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+             and getattr(node.func, "attr", "").startswith("register_")]
+    assert len(calls) == 3 and all(len(call.args) == 1 and not call.keywords for call in calls), \
+        [ast.unparse(call) for call in calls]
     bootstrap = (base / "bootstrap" / "bootstrap.py").read_text(encoding="utf-8")
     assert "Container(strict_interfaces=True)" in bootstrap
     assert not (EXAMPLES / "shared").exists()

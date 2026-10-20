@@ -13,7 +13,8 @@ class ProductService:
 py_autowired `product_repository_instance` alanını çalışma anında doldurur.
 `ProductService` repository'yi import etmez, onu kurucu parametresi olarak
 almaz ve hiçbir container çağrısı yapmaz. Sınıflar birbirinden bağımsız kalır.
-Onları import eden tek yer bir `register/` klasörüdür.
+Bir `register/` klasörü ihtiyaç duyulan sözleşmeleri listeler; her sözleşmenin
+arkasındaki sınıfı py_autowired kendisi bulur.
 
 English: [README.md](README.md)
 
@@ -48,19 +49,18 @@ class ProductController:
         return self.product_service_instance.list_products()
 ```
 
-**2. `register/register.py`** - sınıfları import eden tek dosya; her ihtiyaç
-için hangi sınıfın kullanılacağını ve ne kadar yaşayacağını söyler:
+**2. `register/register.py`** - sözleşmeleri ve her nesnenin ne kadar
+yaşayacağını listeler. Hiçbir uygulama sınıfının adını yazmaz: her sözleşmeyi
+uygulayan tek sınıfı py_autowired bulur:
 
 ```python
-from application.product_service import ProductService
 from domain.product_repository import IProductRepository
 from domain.product_service import IProductService
-from infrastructure.memory_product_repository import MemoryProductRepository
 
 
 def register(container):
-    container.register_scoped(IProductRepository, MemoryProductRepository)
-    container.register_transient(IProductService, ProductService)
+    container.register_scoped(IProductRepository)    # bulur: MemoryProductRepository
+    container.register_transient(IProductService)    # bulur: ProductService
 ```
 
 **3. `bootstrap/bootstrap.py`** - uygulama nasıl ayağa kalkar:
@@ -136,22 +136,25 @@ karşılaştırılır. Alt çizgi ve büyük/küçük harf fark etmez; şu sözl
 
 | Çağrı | Yaşam süresi | Ne için |
 | --- | --- | --- |
-| `container.register_singleton(IClock, SystemClock)` | bütün uygulama için tek nesne | ayarlar, saat, paylaşılabilen istemciler |
+| `container.register_singleton(IClock)` | bütün uygulama için tek nesne | ayarlar, saat, paylaşılabilen istemciler |
 | `container.register_scoped(IRepo, SqlRepo)` | scope başına bir nesne (bir web isteği) | veritabanı oturumu, iş birimi |
-| `container.register_transient(IProductService, ProductService)` | her seferinde yeni nesne | durumsuz servisler |
+| `container.register_transient(IProductService)` | her seferinde yeni nesne | durumsuz servisler |
 | `container.register_instance(Settings, settings)` | verdiğiniz nesne | kendi oluşturduğunuz nesneler; py_autowired onları kapatmaz |
 
-- `register_*(Sözleşme, Uygulama)` - en açık biçim.
-- `register_*(Sözleşme)` - py_autowired sözleşmenin tek uygulamasını kendisi
-  bulur; uygulama başka bir katmanda olsa bile.
+- `register_*(Sözleşme)` - bütün örneklerde kullanılan biçim: py_autowired
+  sözleşmenin tek uygulamasını kendisi bulur; uygulama başka bir katmanda olsa
+  bile.
+- `register_*(Sözleşme, Uygulama)` - bir sözleşmenin birden çok uygulaması
+  varsa gerekir. Yazılmazsa py_autowired tahmin yürütmez,
+  `AmbiguousImplementationError` hatasıyla durur.
 - `register_*(SomutSınıf)` - sınıf kendi uygulamasıdır.
   `Container(strict_interfaces=True)` ile buna izin verilmez.
 - **Yalnız sözleşme:** `Container(strict_interfaces=True)` (bütün örneklerde
   kullanılır) kayıt tipi olarak yalnız arayüz / abstract class kabul eder.
   Böylece projedeki her bağımlılık somut bir sınıfa değil, bir soyutlamaya
   bağlanır.
-- `register_*` satırlarını uygulama sınıflarını import eden tek yer olan
-  `register/` içinde tutun.
+- `register_*` satırlarını `register/` içinde tutun. Böylece hiçbir dosya bir
+  uygulama sınıfını import etmez: import'lar yalnız sözleşmelere gider.
 - Bir sınıfı, **başka bir sınıf ona ihtiyaç duyduğunda** kaydedin. Yalnız
   bağımlılık alan bir sınıf (controller) normal oluşturulur: `ProductController()`.
 - `close()`/`dispose()` (ya da `aclose()`) metodu olan scoped nesneler scope

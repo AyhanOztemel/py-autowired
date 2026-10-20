@@ -1,20 +1,20 @@
-"""Registrations: the ONLY place that imports the application classes.
+"""Registrations: which contracts the application uses and how long each object lives.
 
-Every line pairs a contract (interface / abstract class) with the class that
-implements it, and says how long each object lives:
+Only contracts (interfaces / abstract classes) are named here. py_autowired
+finds the single implementation of each contract in the project by itself.
+If a contract has more than one implementation, name the one to use:
+    container.register_scoped(IProductRepository, SqlProductRepository)
+
   singleton - one object for the whole application
   scoped    - one object per scope (one unit of work)
   transient - a new object every time it is needed
 """
-from application.product_service import ProductService
 from domain.clock import IClock
 from domain.product_repository import IProductRepository
 from domain.product_service import IProductService
-from infrastructure.memory_product_repository import MemoryProductRepository
-from infrastructure.system_clock import SystemClock
 
 
 def register(container):
-    container.register_singleton(IClock, SystemClock)
-    container.register_scoped(IProductRepository, MemoryProductRepository)
-    container.register_transient(IProductService, ProductService)
+    container.register_singleton(IClock)
+    container.register_scoped(IProductRepository)
+    container.register_transient(IProductService)

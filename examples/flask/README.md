@@ -19,8 +19,10 @@ Then open http://127.0.0.1:8002/products
    which contract is meant: `product_service_instance` is an
    `IProductService`, `product_repository_instance` is an
    `IProductRepository`. The fields are filled automatically at runtime.
-2. **`register/` is the only place with imports.** It says which class to
-   create for each need and how long each object lives.
+2. **`register/` names only contracts.** It lists the contracts the
+   application uses and how long each object lives. py_autowired finds the
+   class that implements each contract by itself; no implementation class is
+   imported anywhere.
 3. **`bootstrap/` brings the application up:** it creates the container, adds
    the registrations and connects Flask. Your entry file calls it once:
    `bootstrap(app)`.
@@ -40,33 +42,31 @@ application/            # business logic
 presentation/           # what the user calls
   product_controller.py # needs an IProductService - imports nothing
   routes.py             # the HTTP endpoints (a Blueprint)
-register/               # THE ONLY PLACE THAT IMPORTS THE CLASSES
-  register.py           # which class, how long it lives
+register/               # which contracts are used - names no implementation class
+  register.py           # contract + how long it lives
 bootstrap/              # how the application comes up
   bootstrap.py          # container + registrations + the Flask bridge
 app.py                  # creates the app and calls bootstrap(app)
 requirements.txt        # also marks the project root
 ```
 
-The only other import between layers: an implementation imports the
+Imports between layers point only to `domain/`: an implementation imports the
 contract it implements (`MemoryProductRepository(IProductRepository)`,
-`ProductService(IProductService)`).
+`ProductService(IProductService)`), and `register/` imports the contracts.
+Nothing imports `infrastructure/` or `application/`.
 
 ## register/register.py
 
 ```python
-from application.product_service import ProductService
 from domain.clock import IClock
 from domain.product_repository import IProductRepository
 from domain.product_service import IProductService
-from infrastructure.memory_product_repository import MemoryProductRepository
-from infrastructure.system_clock import SystemClock
 
 
 def register(container):
-    container.register_singleton(IClock, SystemClock)
-    container.register_scoped(IProductRepository, MemoryProductRepository)
-    container.register_transient(IProductService, ProductService)
+    container.register_singleton(IClock)
+    container.register_scoped(IProductRepository)
+    container.register_transient(IProductService)
 ```
 
 ## bootstrap/bootstrap.py
@@ -84,11 +84,17 @@ def bootstrap(app):
     attach_container(app, container)   # scan on the first request, scope per request, close at exit
 ```
 
-| Lifetime | In this example | Meaning |
+| Lifetime | Registered contract → class found automatically | Meaning |
 | --- | --- | --- |
 | `register_singleton` | `IClock` → `SystemClock` | one object for the whole application |
 | `register_scoped` | `IProductRepository` → `MemoryProductRepository` | one object per HTTP request; its `close()` runs at the end |
 | `register_transient` | `IProductService` → `ProductService` | a new object every time one is needed |
+
+**More than one implementation?** If a contract has two implementations (say
+`MemoryProductRepository` and `SqlProductRepository`), py_autowired does not
+guess: it stops with `AmbiguousImplementationError`. Then name the one to use
+as the second argument:
+`container.register_scoped(IProductRepository, SqlProductRepository)`.
 
 `ProductController` is not registered: it only *receives* a dependency and you
 create it yourself with `ProductController()`. Register a class when another
@@ -111,9 +117,8 @@ contract prefixes (and the `Impl` suffix) are understood:
 ## Contracts only: `strict_interfaces=True`
 
 The container in `bootstrap/` is created with `Container(strict_interfaces=True)`:
-only a contract (an interface / abstract class) can be registered, always
-together with its implementation. So every dependency in the project points to
-an abstraction, never to a concrete class.
+only a contract (an interface / abstract class) can be registered, never a
+concrete class. So every dependency in the project points to an abstraction.
 
 ## The bridge
 
@@ -122,14 +127,10 @@ an abstraction, never to a concrete class.
 ## In your own project
 
 1. Write your classes with `*_instance = None` fields; do not import them into each other.
-2. Copy the `register/` and `bootstrap/` folders; change the imports and
-   `register_*` lines in `register/register.py`.
+2. Copy the `register/` and `bootstrap/` folders; in `register/register.py`
+   import your contracts and write one `register_*` line per contract.
 3. Call `bootstrap(...)` once, as in `app.py`.
 
-You can also register only the interface, for example
-`container.register_scoped(IProductRepository)`: py_autowired then finds its
-single implementation by itself. Writing the class explicitly, as above, keeps
-everything visible in one place.
 
 Optional features (validation at startup, `Provider`/`Lazy`, keyed services,
 generics, ...) are explained in the main README under *Optional features*.
