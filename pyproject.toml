@@ -3,14 +3,14 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "py-autowired"
-version = "0.5.0"
-description = "Runtime dependency injection through self.x_instance = None"
+name = "py_autowired"
+version = "0.5.1"
+description = "Runtime dependency injection without imports between your classes: self.x_instance = None"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Ayhan Öztemel" }]
 license = "MIT"
-keywords = ["dependency-injection", "autowiring", "fastapi", "ioc", "runtime-injection"]
+keywords = ["dependency-injection", "autowiring", "fastapi", "flask", "django", "ioc", "runtime-injection"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -65,6 +65,9 @@ tests_dir = ["tests/"]
 also_copy = [
   "src/py_autowired/__init__.py",
   "src/py_autowired/fastapi.py",
+  "src/py_autowired/flask.py",
+  "src/py_autowired/django.py",
+  "src/py_autowired/_web.py",
   "src/py_autowired/py.typed",
   "examples/",
   "README.md",

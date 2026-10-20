@@ -557,7 +557,7 @@ class Container:
 
     def _implementation_for(
         self, service_type: Type[Any], implementation_type: Optional[Type[Any]]
-    ) -> Type[Any]:
+    ) -> Optional[Type[Any]]:
         if implementation_type is not None:
             return implementation_type
         if not inspect.isabstract(service_type):
@@ -578,8 +578,18 @@ class Container:
                     f"Selected implementation is not concrete: {selected.__name__}"
                 )
             return selected
+        return self._discovered_implementation(service_type, defer=True)
+
+    @staticmethod
+    def _discovered_implementation(service_type: Type[Any], *, defer: bool) -> Optional[Type[Any]]:
+        # In a layered project the implementation usually lives in a module
+        # that discovery imports only at startup, after the registrations. With
+        # defer=True an interface registered before that keeps no implementation
+        # yet; it is looked up again once modules are loaded or on first resolve.
         candidates = _concrete_subclasses(service_type)
         if not candidates:
+            if defer:
+                return None
             raise ResolutionError(
                 f"No imported concrete implementation found for {service_type.__name__}"
             )
@@ -738,6 +748,79 @@ class Container:
                 ordered.append(instance)
         self._singleton_order.clear()
         return ordered
+
+    def _complete_implementations(self) -> None:
+        """Give interface-only registrations the implementation imported since.
+
+        Called by auto_inject after discovery has imported the project, so the
+        name map and validation see the implementation. Registrations whose
+        implementation is still missing are left for resolve() to report.
+        """
+        with self._registration_lock:
+            pending = [
+                registration
+                for registration in (*self.registrations.values(), *self._keyed.values())
+                if registration.implementation_type is None
+                and registration.factory is None
+                and not registration.has_instance
+                and inspect.isabstract(registration.service_type)
+            ]
+            for registration in pending:
+                registration.implementation_type = self._discovered_implementation(
+                    registration.service_type, defer=True
+                )
+
+    def _detach_created_singletons(self) -> list[Any]:
+        """Host shutdown: forget container-created singletons, stay usable.
+
+        Used by the framework bridges when the application stops. Unlike
+        close()/aclose(), the container is not closed: the next startup of the
+        same application (tests often start one app several times) creates
+        fresh singletons. Objects supplied through register_instance are never
+        returned. The result is in disposal order (reverse creation order).
+        """
+        if self._closed:
+            return []
+        created, self._singleton_order = self._singleton_order, []
+        created_ids = {id(instance) for instance in created}
+        with self._registration_lock:
+            registrations = (
+                *self.registrations.values(),
+                *self._keyed.values(),
+                *self._closed_generics.values(),
+            )
+            for registration in registrations:
+                if registration.has_instance and id(registration.instance) in created_ids:
+                    registration.instance = _UNSET
+        ordered: list[Any] = []
+        seen: set[int] = set()
+        for instance in reversed(created):
+            if id(instance) not in seen:  # one disposal per object identity
+                seen.add(id(instance))
+                ordered.append(instance)
+        return ordered
+
+    def _release_singletons(self) -> None:
+        """Synchronous host shutdown (WSGI bridges); see _detach_created_singletons."""
+        errors: list[BaseException] = []
+        for instance in self._detach_created_singletons():
+            try:
+                _ScopeState._sync_finalize(instance)
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            _raise_disposal_errors(errors)
+
+    async def _arelease_singletons(self) -> None:
+        """Asynchronous host shutdown (ASGI bridges); see _detach_created_singletons."""
+        errors: list[BaseException] = []
+        for instance in self._detach_created_singletons():
+            try:
+                await _ScopeState._async_finalize(instance)
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            _raise_disposal_errors(errors)
 
     def close(self) -> None:
         """Dispose container-created singletons in reverse creation order.
@@ -902,7 +985,11 @@ class Container:
                 return instance
             implementation = registration.implementation_type
             if implementation is None:
-                raise ResolutionError(f"Registration has no implementation: {service_type.__name__}")
+                if not inspect.isabstract(service_type):
+                    raise ResolutionError(f"Registration has no implementation: {service_type.__name__}")
+                # Interface registered before its implementation was imported.
+                implementation = self._discovered_implementation(service_type, defer=False)
+                registration.implementation_type = implementation
             # auto_inject fills these fields after construction, so a class that
             # only uses field injection must not have its __init__ resolved. One
             # that also takes constructor dependencies still gets them.

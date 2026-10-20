@@ -8,6 +8,7 @@ container per process. Request scopes are isolated through context variables.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 import sys
 from typing import Any, Callable, Coroutine, Iterable, TypeVar
 
@@ -15,7 +16,7 @@ from anyio import CancelScope
 from fastapi import FastAPI, Request
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .autowired import activate_container, auto_inject
+from .autowired import _find_project_root, activate_container, auto_inject
 from .container import Container
 
 
@@ -52,6 +53,7 @@ def attach_container(
     root_dir: str | None = None,
     exclude_dirs: Iterable[str] | None = None,
     validate: bool = False,
+    close_on_shutdown: bool = True,
 ) -> FastAPI:
     """Install startup autowiring and a fresh async scope for every HTTP request.
 
@@ -61,7 +63,18 @@ def attach_container(
     :func:`auto_inject`. Opt-in validation runs during lifespan startup.
     All middleware and exception handlers, including Exception/500 handlers,
     run inside the request scope.
+
+    Without ``root_dir`` the project root is searched upwards from the file
+    that calls ``attach_container``, so ``uvicorn main:app`` and
+    ``python main.py`` find the same project. With ``close_on_shutdown`` (the
+    default) container-created singletons are disposed when the application
+    stops; a later startup creates fresh ones. Supplied instances
+    (``register_instance``) are never disposed.
     """
+    if root_dir is None:
+        caller = sys._getframe(1).f_globals.get("__file__")
+        if caller:
+            root_dir = str(_find_project_root(Path(caller).resolve().parent))
     if hasattr(app.state, "py_autowired_container"):
         raise ValueError("A container is already attached to this application")
     if app.middleware_stack is not None:
@@ -73,8 +86,13 @@ def attach_container(
     async def lifespan(application: FastAPI):
         auto_inject(container, root_dir=root_dir, exclude_dirs=exclude_dirs, validate=validate)
         activate_container(container)
-        async with previous_lifespan(application) as state:
-            yield state
+        try:
+            async with previous_lifespan(application) as state:
+                yield state
+        finally:
+            if close_on_shutdown:
+                with CancelScope(shield=True):
+                    await container._arelease_singletons()
 
     def build_middleware_stack() -> ASGIApp:
         # Wrap the complete stack, including Starlette's ServerErrorMiddleware.

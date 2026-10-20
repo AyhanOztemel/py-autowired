@@ -5,6 +5,8 @@ import re
 import inspect
 import sys
 import importlib
+import importlib.abc
+import importlib.machinery
 import os
 import threading
 import dis
@@ -234,6 +236,17 @@ def _build_name_map_from_container(container):
             # Abs_Service -> service (🎯 YENI!)
             elif name.startswith('abs_') and len(name) > 4:
                 generic_key = _norm(name[4:])
+                name_map[generic_key].append(reg)
+
+            # I_Service -> service
+            elif name.startswith('I_') and len(name) > 2:
+                generic_key = _norm(name[2:])
+                name_map[generic_key].append(reg)
+
+            # ABSService / AbsService / absService -> service (no underscore;
+            # the next letter must be upper case, so "Absolute" stays a word)
+            elif name[:3] in ('ABS', 'Abs', 'abs') and len(name) > 3 and name[3].isupper():
+                generic_key = _norm(name[3:])
                 name_map[generic_key].append(reg)
 
             # IService -> service (MEVCUT)
@@ -526,14 +539,17 @@ def _patch_init(cls, container, name_map):
 # MODULE DISCOVERY - FIXED!
 # ============================================================================
 
-def _find_project_root() -> Path:
+def _find_project_root(start: Optional[Path] = None) -> Path:
     """
     🔧 FIX: Find the actual project root directory.
-    Searches for common project markers.
+    Searches for common project markers, upwards from ``start`` or, when it is
+    not given, from the __main__ module's directory.
     """
     # Start from __main__ module's directory if available
     main_mod = sys.modules.get("__main__")
-    if main_mod and hasattr(main_mod, "__file__") and main_mod.__file__:
+    if start is not None:
+        current = Path(start).resolve()
+    elif main_mod and hasattr(main_mod, "__file__") and main_mod.__file__:
         current = Path(main_mod.__file__).resolve().parent
     else:
         current = Path.cwd()
@@ -630,7 +646,13 @@ def _discover_and_load_modules(root: Path, exclude_dirs: Optional[Iterable[str]]
     for p in py_files:
         # 🆕 v2: Dışlanan dizinler (.venv, site-packages, __pycache__ vb.) —
         #        sanal ortamın binlerce dosyasının import edilmesini engeller.
-        if excluded_dirs.intersection(p.parts):
+        # Only folders INSIDE the project count: a project that itself lives
+        # under e.g. ``.../examples/`` must still be discovered.
+        try:
+            inner_dirs = p.relative_to(root).parts[:-1]
+        except ValueError:
+            inner_dirs = p.parts
+        if excluded_dirs.intersection(inner_dirs):
             continue
 
         # Skip conditions
@@ -686,6 +708,154 @@ def _discover_and_load_modules(root: Path, exclude_dirs: Optional[Iterable[str]]
 # MAIN FUNCTION - FIXED!
 # ============================================================================
 
+def _patch_module_classes(mod, container, name_map) -> int:
+    """Patch the injection candidates of the classes defined in ``mod``."""
+    patched = 0
+    for cls_name, cls in inspect.getmembers(mod, inspect.isclass):
+        if getattr(cls, "__module__", None) != mod.__name__:
+            continue
+
+        # 🆕 v2: SEÇİCİ PATCH — '*_instance' adayı olmayan sınıflar
+        #        patch'lenmez → DI'sız sınıflarda setattr/__init__
+        #        vergisi tamamen sıfırlanır.
+        #        Eski davranış için: DI_PATCH_ALL=1
+        if not PATCH_ALL_MODE:
+            candidates = cls.__dict__.get("__di_attrs__")
+            if candidates is None:
+                candidates = _find_di_candidates(cls)
+                try:
+                    cls.__di_attrs__ = candidates
+                except (TypeError, AttributeError):
+                    pass  # bazı exotic tipler attribute kabul etmez
+            if not candidates:
+                # Include skipped classes in opt-in diagnostics without
+                # installing any new injection wrapper or field candidate.
+                try:
+                    _remember_patched_class(container, cls)
+                except Exception:  # bookkeeping must never break patching
+                    pass
+                if DEBUG_MODE:
+                    logger.debug(f"Skipped {cls.__name__} (no injection candidates)")
+                continue
+
+        _patch_setattr(cls, container, name_map)
+        _patch_init(cls, container, name_map)
+        patched += 1
+
+        if DEBUG_MODE:
+            logger.debug(f"Patched {cls.__name__}")
+    return patched
+
+
+# ============================================================================
+# MODULES IMPORTED AFTER auto_inject()
+# ============================================================================
+# Startup discovery imports the project once and skips some places on purpose
+# (virtual environments, build copies, tests, ``_private.py`` files, ...). A
+# project module that loads later - a lazy import, or a file from such a place -
+# is patched the moment it is imported, so no ``*_instance`` field is missed
+# because of where or when its module loads. Modules outside the project roots
+# are never touched, and ordinary imports cost one prefix check.
+
+_LATE_ROOTS: list[str] = []      # normalised project roots, each ending in a separator
+_PENDING_LATE_MODULES: list = []  # imported while the global lock was busy
+_STARTUP = threading.local()      # set while auto_inject() runs in this thread
+
+
+def _is_late_root_path(path: str) -> bool:
+    candidate = os.path.normcase(os.path.abspath(path))
+    return any(candidate.startswith(root) for root in _LATE_ROOTS)
+
+
+def _remember_late_root(root: Path) -> None:
+    for form in (str(root), os.path.abspath(str(root))):
+        prefix = os.path.normcase(form)
+        if not prefix.endswith(os.sep):
+            prefix += os.sep
+        if prefix not in _LATE_ROOTS:
+            _LATE_ROOTS.append(prefix)
+    if not any(isinstance(finder, _LateImportFinder) for finder in sys.meta_path):
+        sys.meta_path.insert(0, _LateImportFinder())
+
+
+def _drain_late_modules() -> None:
+    """Patch modules that were imported while the lock was busy. Caller holds the lock."""
+    cache = _NAME_MAP_CACHE
+    if cache is None:
+        return
+    name_map = cache.get_raw_map()
+    while _PENDING_LATE_MODULES:
+        try:
+            module = _PENDING_LATE_MODULES.pop()
+        except IndexError:
+            break
+        try:
+            _patch_module_classes(module, cache._container, name_map)
+        except Exception:
+            logger.warning("Could not patch late-imported module %s", module.__name__, exc_info=True)
+
+
+def _patch_late_module(module) -> None:
+    if getattr(_STARTUP, "active", False):
+        return  # auto_inject() patches every module it loads itself
+    # A bounded wait: another thread may hold the lock while it waits for this
+    # very import; the module is then queued for the next lock holder.
+    if not _GLOBAL_LOCK.acquire(timeout=0.5):
+        _PENDING_LATE_MODULES.append(module)
+        return
+    try:
+        _PENDING_LATE_MODULES.append(module)
+        _drain_late_modules()
+    finally:
+        _GLOBAL_LOCK.release()
+
+
+class _LateImportLoader(importlib.machinery.SourceFileLoader):
+    def exec_module(self, module) -> None:
+        super().exec_module(module)
+        _patch_late_module(module)
+
+
+class _LateImportFinder(importlib.abc.MetaPathFinder):
+    """Asks the other finders and marks project source modules for patching."""
+
+    def find_spec(self, fullname, path, target=None):
+        if not _LATE_ROOTS:
+            return None
+        for finder in sys.meta_path:
+            if finder is self:
+                continue
+            find_spec = getattr(finder, "find_spec", None)
+            if find_spec is None:
+                continue
+            spec = find_spec(fullname, path, target)
+            if spec is not None:
+                break
+        else:
+            return None
+        loader = spec.loader
+        if (type(loader) is importlib.machinery.SourceFileLoader
+                and spec.origin and _is_late_root_path(spec.origin)):
+            spec.loader = _LateImportLoader(loader.name, loader.path)
+        return spec
+
+
+def _startup_patching(func):
+    """Mark auto_inject() as running, then catch up on queued late imports."""
+    @wraps(func)
+    def run(*args, **kwargs):
+        previous = getattr(_STARTUP, "active", False)
+        _STARTUP.active = True
+        try:
+            result = func(*args, **kwargs)
+        finally:
+            _STARTUP.active = previous
+        _drain_late_modules()
+        return result
+
+    return run
+
+
 def _serialized_class_patching(func):
     """Serialize global class/cache mutation without changing the public API."""
     @wraps(func)
@@ -697,6 +867,7 @@ def _serialized_class_patching(func):
 
 
 @_serialized_class_patching
+@_startup_patching
 def auto_inject(
     container,
     root_dir: str | None = None,
@@ -733,6 +904,7 @@ def auto_inject(
 
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
+    _remember_late_root(root)
 
     if DEBUG_MODE:
         logger.debug(f"Root directory: {root}")
@@ -752,6 +924,12 @@ def auto_inject(
         logger.debug("3. All imports failed")
         logger.debug("Set root_dir explicitly:")
         logger.debug("auto_inject(container, root_dir='/absolute/path/to/project')")
+
+    # Interfaces registered before their implementation module was imported
+    # get it now, so the name map and validation see it.
+    complete_implementations = getattr(container, "_complete_implementations", None)
+    if complete_implementations is not None:
+        complete_implementations()
 
     # Build cached name map
     global _NAME_MAP_CACHE
@@ -779,39 +957,7 @@ def auto_inject(
             mod_info = _get_module_depth_info(mod_name)
             logger.debug(f"Module: {mod_name} (depth: {mod_info['depth']})")
 
-        for cls_name, cls in inspect.getmembers(mod, inspect.isclass):
-            if getattr(cls, "__module__", None) != mod.__name__:
-                continue
-
-            # 🆕 v2: SEÇİCİ PATCH — '*_instance' adayı olmayan sınıflar
-            #        patch'lenmez → DI'sız sınıflarda setattr/__init__
-            #        vergisi tamamen sıfırlanır.
-            #        Eski davranış için: DI_PATCH_ALL=1
-            if not PATCH_ALL_MODE:
-                candidates = cls.__dict__.get("__di_attrs__")
-                if candidates is None:
-                    candidates = _find_di_candidates(cls)
-                    try:
-                        cls.__di_attrs__ = candidates
-                    except (TypeError, AttributeError):
-                        pass  # bazı exotic tipler attribute kabul etmez
-                if not candidates:
-                    # Include skipped classes in opt-in diagnostics without
-                    # installing any new injection wrapper or field candidate.
-                    try:
-                        _remember_patched_class(container, cls)
-                    except Exception:  # bookkeeping must never break patching
-                        pass
-                    if DEBUG_MODE:
-                        logger.debug(f"Skipped {cls.__name__} (no injection candidates)")
-                    continue
-
-            _patch_setattr(cls, container, name_map)
-            _patch_init(cls, container, name_map)
-            patched += 1
-
-            if DEBUG_MODE:
-                logger.debug(f"Patched {cls.__name__}")
+        patched += _patch_module_classes(mod, container, name_map)
 
     if DEBUG_MODE:
         logger.debug("Autowiring complete")
@@ -858,6 +1004,7 @@ def refresh():
     with _GLOBAL_LOCK:
         if _NAME_MAP_CACHE is not None:
             _NAME_MAP_CACHE.refresh()
+            _drain_late_modules()
             if DEBUG_MODE:
                 logger.debug("Name map refreshed; resolution cache cleared")
             return True
@@ -877,6 +1024,7 @@ def activate_container(container) -> None:
     with _GLOBAL_LOCK:
         if _NAME_MAP_CACHE is None or _NAME_MAP_CACHE._container is not container:
             _NAME_MAP_CACHE = _CachedNameMap(container)
+        _drain_late_modules()
 
 # ============================================================================
 # BONUS: Performance monitoring utilities
