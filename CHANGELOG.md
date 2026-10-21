@@ -14,13 +14,17 @@ is no longer only a DEBUG line. Nothing is removed; nothing about it is hidden.
   `validate=True` (no service is constructed): a wiring problem is logged as
   ERROR at once instead of appearing when a field is first used. If the
   `auto_inject()` call that skipped it had `validate=True`, the import of the
-  file fails with `AutowiringValidationError` (and fails again if retried). A
+  file fails with `AutowiringValidationError` (and fails again if retried). If
+  the file finished loading in another thread while the library lock was busy,
+  that import cannot be failed any more: the problem is logged as ERROR at once
+  and the next `auto_inject()` or `validate_autowiring()` raises it. A
   healthy file logs INFO `Checked ... no wiring problems`. The check runs on
   every route the file can load by: the import hook, another thread (when the
   lock is free again), a later `auto_inject()`, or `validate_autowiring()`.
 - `validate=True` / `validate_autowiring()`: skipped files that have not loaded
   yet are named on a line of their own (in the error message, or as an INFO
-  line when validation passes).
+  line when validation passes). A skipped file that is never imported is never
+  checked; import the names from `skipped_during_discovery()` in a test.
 
 ### Changed
 

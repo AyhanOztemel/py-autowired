@@ -949,6 +949,10 @@ def _drain_late_modules() -> dict:
         error = _check_deferred(module, cache._container, name_map)
         if error is not None:
             failed[module.__name__] = error
+            # Its importer may be gone (queued import) or may retry: keep it
+            # pending, so the next import, auto_inject() or validate_autowiring()
+            # checks it again and raises.
+            _DEFERRED[module.__name__] = True
     return failed
 
 
@@ -963,8 +967,6 @@ def _patch_late_module(module) -> None:
     try:
         _PENDING_LATE_MODULES.append(module)
         error = _drain_late_modules().get(module.__name__)
-        if error is not None:
-            _DEFERRED[module.__name__] = True  # a retried import is checked (and fails) again
     finally:
         _GLOBAL_LOCK.release()
     if error is not None:

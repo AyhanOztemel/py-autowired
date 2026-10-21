@@ -388,6 +388,13 @@ def test_files_skipped_at_startup_load_and_are_wired():
 `validate_autowiring(container)` also checks a skipped file that has loaded
 since, and names the ones that have not loaded yet on a line of their own.
 
+A skipped file that is **never imported** is never checked: it stays an INFO
+line and a name in `skipped_during_discovery()`. If your server starts from the
+application module itself, import the skipped files in a test as above. If a
+file finishes loading in another thread while the library is busy, its import
+cannot be failed any more: the problem is logged as ERROR at once and, with
+`validate=True`, the next `auto_inject()` or `validate_autowiring()` raises it.
+
 ## Notes
 
 - **Concurrency:** ready singletons and cached lookups are lock-free. A

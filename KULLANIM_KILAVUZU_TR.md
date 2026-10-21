@@ -388,6 +388,14 @@ def test_acilista_atlanan_dosyalar_yuklenir_ve_baglanir():
 `validate_autowiring(container)` de o zamandan beri yüklenmiş atlanan dosyayı
 denetler; henüz yüklenmemiş olanları ayrı bir satırda adıyla bildirir.
 
+**Hiç import edilmeyen** atlanmış dosya hiç denetlenmez: bir INFO satırı ve
+`skipped_during_discovery()` içinde bir ad olarak kalır. Sunucunuz doğrudan
+uygulama modülünden başlıyorsa atlanan dosyaları yukarıdaki gibi bir testte
+import edin. Bir dosya, kütüphane meşgulken başka bir thread'de yüklenmeyi
+bitirirse artık o import durdurulamaz: sorun hemen ERROR olarak yazılır ve
+`validate=True` ise sonraki `auto_inject()` ya da `validate_autowiring()` onu
+hata olarak fırlatır.
+
 ## Notlar
 
 - **Eşzamanlılık:** hazır singleton'lar ve önbellek okumaları kilitsizdir. Bir

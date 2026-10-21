@@ -470,3 +470,53 @@ def test_with_validate_every_later_import_of_the_broken_file_fails_too(make_proj
     module, error = _import(f"main_{tag}")                    # e.g. a retry: still broken
     assert isinstance(first_error, AutowiringValidationError)
     assert module is None and isinstance(error, AutowiringValidationError)
+
+
+def _import_while_the_lock_is_busy(name):
+    """The import hook cannot take the lock: the module is queued and its import succeeds."""
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with autowired._GLOBAL_LOCK:
+            held.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    held.wait(5)
+    try:
+        return _import(name)
+    finally:
+        release.set()
+        holder.join(5)
+
+
+def test_a_queued_failure_with_validate_is_raised_by_the_next_auto_inject(make_project, caplog):
+    root, tag = make_project(MISSING, validate=True)
+    app = importlib.import_module(f"app_{tag}")
+    module, error = _import_while_the_lock_is_busy(f"main_{tag}")
+    assert error is None and module is not None             # the import finished; nobody to raise to
+    with caplog.at_level(logging.DEBUG, logger="py_autowired"):
+        autowired.refresh()                                  # drains the queue: the check runs here
+    assert len(_records(caplog, logging.ERROR, f"main_{tag}", "no matching registration")) == 1
+    try:
+        autowired.auto_inject(app.container, root_dir=str(root))
+        later = None
+    except AutowiringValidationError as caught:
+        later = caught
+    assert later is not None
+    assert f"main_{tag}.Consumer.missing_thing_instance: no matching registration" in later.issues
+
+
+def test_control_a_queued_failure_is_in_the_next_validate_autowiring(make_project):
+    _root, tag = make_project(MISSING, validate=True)
+    app = importlib.import_module(f"app_{tag}")
+    _import_while_the_lock_is_busy(f"main_{tag}")
+    autowired.refresh()
+    try:
+        autowired.validate_autowiring(app.container)
+        later = None
+    except AutowiringValidationError as caught:
+        later = caught
+    assert later is not None
+    assert f"main_{tag}.Consumer.missing_thing_instance: no matching registration" in later.issues
