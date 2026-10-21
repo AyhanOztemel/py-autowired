@@ -216,7 +216,9 @@ It lists fields with no matching registration, equally good candidates,
 constructor dependencies that cannot be resolved, dependency cycles, and a
 singleton that would capture a scoped service. It only reads; it constructs no
 services. To check again later: `validate_autowiring(container)`
-(raises `AutowiringValidationError` with `.issues`).
+(raises `AutowiringValidationError` with `.issues`). A file that could not be
+loaded during discovery is named on a line of its own and checked when it loads
+(see [Files loaded after startup](#files-loaded-after-startup)).
 
 ### `Provider[T]` and `Lazy[T]`
 
@@ -359,10 +361,32 @@ The library logs to `logging.getLogger("py_autowired")` and is silent by
 default. Discovery problems are logged as WARNING. Set `PY_AUTOWIRED_DEBUG=1`
 before import for detailed DEBUG output.
 
+### Files loaded after startup
+
 A project file that imports the application module while that module is
 still starting (for example `main.py` doing `from app import app`) cannot be
-loaded during discovery. This is not an error: it is logged at DEBUG only,
-and its `*_instance` fields are still filled when the file is imported later.
+loaded during discovery. It is not lost, and nothing about it is hidden:
+
+- startup logs it at INFO: `Skipped main during discovery: ... it is checked when it loads`;
+- the moment it loads, its `*_instance` fields are filled **and checked** the
+  way `validate=True` checks them. A problem is logged as ERROR at once (with
+  `validate=True` the import of that file fails with `AutowiringValidationError`),
+  so it never waits until the field is used. A healthy file logs INFO
+  `Checked main after it loaded ...`;
+- `skipped_during_discovery()` returns the names, so a test can load them:
+
+```python
+import importlib
+from py_autowired import skipped_during_discovery
+
+def test_files_skipped_at_startup_load_and_are_wired():
+    import app                                   # the application starts
+    for name in skipped_during_discovery():
+        importlib.import_module(name)            # checked now (validate=True: raises on a problem)
+```
+
+`validate_autowiring(container)` also checks a skipped file that has loaded
+since, and names the ones that have not loaded yet on a line of their own.
 
 ## Notes
 

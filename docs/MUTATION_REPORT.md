@@ -161,3 +161,22 @@ identity vs equality (classes; registrations, which never compare equal
 because each holds its own lock; the unset marker), and 1 policy comparison
 (`== "replace"` vs `>= "replace"`: the other policies, "register" and
 "fallback", sort before it).
+
+## 0.5.3 and 0.5.4 additions
+
+Both releases changed a few dozen lines around discovery, so every changed line
+got hand-written mutants (one snippet replaced per mutant, the related test
+files run against each copy).
+
+| Release | Changed code | Mutants | Killed | Equivalent |
+|---|---|---:|---:|---:|
+| 0.5.3 | `_still_importing`, the circular-import branch of the module import | 15 | 15 | 0 |
+| 0.5.4 | skipped-module list, the load-time check on every route, `validate=True` output | 50 | 50 | 0 |
+| 0.5.4 | the 15 mutants of 0.5.3 again, on the 0.5.4 code | 15 | 15 | 0 |
+
+The 0.5.4 mutants include every way a problem could be hidden again: the skip
+logged at DEBUG, the check result logged below ERROR, the check skipped on one
+of its routes (import hook, a busy lock, a later `auto_inject()`,
+`validate_autowiring()`), the `validate=True` failure not raised or not raised
+again on a retry, and a real import failure logged at DEBUG or INFO.
+

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.4 - 2026-10-21
+
+A file that discovery cannot load yet (it imports the application module while
+that module is still starting, typically `main.py` doing `from app import app`)
+is no longer only a DEBUG line. Nothing is removed; nothing about it is hidden.
+
+### Added
+
+- `skipped_during_discovery()`: the module names the latest discovery skipped
+  this way, so applications and tests can load and check them.
+- Such a file is checked the moment it loads, with the same static check as
+  `validate=True` (no service is constructed): a wiring problem is logged as
+  ERROR at once instead of appearing when a field is first used. If the
+  `auto_inject()` call that skipped it had `validate=True`, the import of the
+  file fails with `AutowiringValidationError` (and fails again if retried). A
+  healthy file logs INFO `Checked ... no wiring problems`. The check runs on
+  every route the file can load by: the import hook, another thread (when the
+  lock is free again), a later `auto_inject()`, or `validate_autowiring()`.
+- `validate=True` / `validate_autowiring()`: skipped files that have not loaded
+  yet are named on a line of their own (in the error message, or as an INFO
+  line when validation passes).
+
+### Changed
+
+- The skip itself is logged at INFO (was DEBUG): `Skipped X during discovery:
+  it imports Y, which is still being imported; it is checked when it loads`.
+  Real import failures are still WARNINGs.
+
 ## 0.5.3 - 2026-10-21
 
 ### Fixed

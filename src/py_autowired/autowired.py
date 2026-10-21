@@ -81,11 +81,13 @@ class AutowiringValidationError(DependencyInjectionError):
     ``issues`` is an immutable tuple of English diagnostic strings.
     """
 
-    def __init__(self, issues):
+    def __init__(self, issues, skipped=()):
         self.issues = tuple(issues)
-        super().__init__(
-            "Autowiring validation failed:\n" + "\n".join(f"- {issue}" for issue in self.issues)
-        )
+        lines = [f"- {issue}" for issue in self.issues]
+        if skipped:
+            lines.append("Not checked yet (skipped during discovery; checked when they load): "
+                         + ", ".join(skipped))
+        super().__init__("Autowiring validation failed:\n" + "\n".join(lines))
 
 
 class AutoInjectionResolutionError(DependencyInjectionError, RuntimeError):
@@ -648,6 +650,27 @@ def _still_importing(error: BaseException) -> Optional[str]:
     return None
 
 
+# A module discovery skips because it imports one that is still being imported
+# is not lost: it is listed, and checked the moment it loads (_check_deferred).
+_DISCOVERING: list = []          # one list per running discovery (calls can nest)
+_SKIPPED: Tuple[str, ...] = ()   # what the latest discovery skipped
+_DEFERRED: Dict[str, bool] = {}  # skipped, not checked yet -> validate flag of its auto_inject()
+
+
+def _is_loading(module) -> bool:
+    return bool(getattr(getattr(module, "__spec__", None), "_initializing", False))
+
+
+def skipped_during_discovery() -> Tuple[str, ...]:
+    """Modules the latest discovery could not load yet.
+
+    Each one imports a module that was still being imported (typically an
+    entry point such as ``main.py`` doing ``from app import app``). It is
+    patched and checked the moment it loads; import it to see the result.
+    """
+    return _SKIPPED
+
+
 def _import_module_safely(dotted_name: str, file_path: str) -> bool:
     """Import one discovered module; log why it was not loaded."""
     try:
@@ -663,11 +686,15 @@ def _import_module_safely(dotted_name: str, file_path: str) -> bool:
     except Exception as e:
         importing = _still_importing(e)
         if importing is not None:
-            # Not an error: the module imports one that is still loading.
-            logger.debug(
-                "Skipped %s during discovery: it imports %s, which is still being imported",
+            # Not an error yet: the module imports one that is still loading.
+            # It is checked when it loads, so a real problem cannot hide here.
+            logger.info(
+                "Skipped %s during discovery: it imports %s, which is still being imported; "
+                "it is checked when it loads",
                 dotted_name, importing,
             )
+            if _DISCOVERING:
+                _DISCOVERING[-1].append(dotted_name)
             return False
         logger.warning(f"Import failed for {dotted_name}: {e}")
         return False
@@ -682,6 +709,18 @@ def _normalize_excluded_dirs(exclude_dirs: Optional[Iterable[str]]) -> frozenset
 
 
 def _discover_and_load_modules(root: Path, exclude_dirs: Optional[Iterable[str]] = None) -> int:
+    """Load the project's modules; remember the ones skipped as still loading."""
+    global _SKIPPED
+    skipped = []
+    _DISCOVERING.append(skipped)
+    try:
+        return _load_project_modules(root, exclude_dirs)
+    finally:
+        _DISCOVERING.pop()
+        _SKIPPED = tuple(sorted(set(skipped)))  # the same order on every file system
+
+
+def _load_project_modules(root: Path, exclude_dirs: Optional[Iterable[str]] = None) -> int:
     """
     🔧 FIXED: Discover and load all modules recursively.
     Now correctly handles nested directory structures.
@@ -839,12 +878,65 @@ def _remember_late_root(root: Path) -> None:
         sys.meta_path.insert(0, _LateImportFinder())
 
 
-def _drain_late_modules() -> None:
-    """Patch modules that were imported while the lock was busy. Caller holds the lock."""
+def _check_deferred(module, container, name_map):
+    """Check a module that discovery skipped, now that it has loaded.
+
+    Its classes are patched (unless the import hook already did it) and get
+    the static check of validate_autowiring(), so a wiring problem is reported
+    now instead of when a field is first used. Returns the error if the
+    auto_inject() call that skipped the module had validate=True.
+    Caller holds the lock.
+    """
+    name = module.__name__
+    if name not in _DEFERRED:
+        return None
+    strict = _DEFERRED.pop(name)
+    try:
+        _patch_module_classes(module, container, name_map)
+        classes = [cls for _, cls in inspect.getmembers(module, inspect.isclass)
+                   if getattr(cls, "__module__", None) == name]
+        _validate_autowiring(container, classes)
+    except AutowiringValidationError as error:
+        failure = error
+    except Exception as error:
+        failure = AutowiringValidationError([f"{name}: could not be checked: {error!r}"])
+        failure.__cause__ = error
+    else:
+        logger.info("Checked %s after it loaded (it was skipped during discovery): no wiring problems", name)
+        return None
+    logger.error("%s was skipped during discovery and has wiring problems now that it is loaded:\n%s",
+                 name, "\n".join(f"- {issue}" for issue in failure.issues))
+    return failure if strict else None
+
+
+def _check_loaded_deferred(container, name_map=None):
+    """Check skipped modules that loaded without passing the import hook.
+
+    Returns the first error a validate=True caller asked for. Caller holds the lock.
+    """
+    failure = None
+    for name in list(_DEFERRED):
+        module = sys.modules.get(name)
+        if module is None or _is_loading(module):
+            continue
+        if name_map is None:
+            name_map = _build_name_map_from_container(container)
+        error = _check_deferred(module, container, name_map)
+        if failure is None:
+            failure = error
+    return failure
+
+
+def _drain_late_modules() -> dict:
+    """Patch modules that were imported while the lock was busy. Caller holds the lock.
+
+    Returns {module name: error} for skipped modules whose check failed with validate=True.
+    """
     cache = _NAME_MAP_CACHE
     if cache is None:
-        return
+        return {}
     name_map = cache.get_raw_map()
+    failed = {}
     while _PENDING_LATE_MODULES:
         try:
             module = _PENDING_LATE_MODULES.pop()
@@ -854,11 +946,15 @@ def _drain_late_modules() -> None:
             _patch_module_classes(module, cache._container, name_map)
         except Exception:
             logger.warning("Could not patch late-imported module %s", module.__name__, exc_info=True)
+        error = _check_deferred(module, cache._container, name_map)
+        if error is not None:
+            failed[module.__name__] = error
+    return failed
 
 
 def _patch_late_module(module) -> None:
     if getattr(_STARTUP, "active", False):
-        return  # auto_inject() patches every module it loads itself
+        return  # auto_inject() patches (and checks) every module it loads itself
     # A bounded wait: another thread may hold the lock while it waits for this
     # very import; the module is then queued for the next lock holder.
     if not _GLOBAL_LOCK.acquire(timeout=0.5):
@@ -866,9 +962,13 @@ def _patch_late_module(module) -> None:
         return
     try:
         _PENDING_LATE_MODULES.append(module)
-        _drain_late_modules()
+        error = _drain_late_modules().get(module.__name__)
+        if error is not None:
+            _DEFERRED[module.__name__] = True  # a retried import is checked (and fails) again
     finally:
         _GLOBAL_LOCK.release()
+    if error is not None:
+        raise error  # validate=True: this import fails, like a failed startup check
 
 
 class _LateImportLoader(importlib.machinery.SourceFileLoader):
@@ -950,6 +1050,9 @@ def auto_inject(
             Built-in safety exclusions remain active.
         validate: Inspect patched fields without constructing services and raise
             one AutowiringValidationError containing all static problems.
+            A module skipped during discovery (it imports a module that is
+            still being imported) is checked when it loads; with validate=True
+            a problem found then makes that import fail.
     Returns:
         Number of patched classes
     """
@@ -976,6 +1079,8 @@ def auto_inject(
         loaded_count = _discover_and_load_modules(root)
     else:
         loaded_count = _discover_and_load_modules(root, exclude_dirs)
+    for name in _SKIPPED:
+        _DEFERRED[name] = validate
 
     if loaded_count == 0 and DEBUG_MODE:
         logger.debug("No modules could be loaded")
@@ -1025,8 +1130,13 @@ def auto_inject(
         logger.debug(f"Loaded {loaded_count} modules; patched {patched} classes")
         logger.debug("=" * 60)
 
+    # A skipped module that loaded while this call ran (during its discovery)
+    # did not pass through the import hook: check it now.
+    failure = _check_loaded_deferred(container, name_map)
     if validate:
         validate_autowiring(container)
+    if failure is not None:
+        raise failure
     return patched
 
 
@@ -1036,12 +1146,17 @@ def validate_autowiring(container) -> None:
     The check does not construct objects/services, call factories or field
     descriptors, or open scopes. It may evaluate type annotations, which can
     execute user code. It cannot predict arbitrary constructor/factory behavior.
+    A module skipped during discovery that has loaded since is patched and
+    checked first; one that has not loaded yet is named on a line of its own.
     """
     with _GLOBAL_LOCK:
+        # A skipped module may have loaded around the import hook: check it first.
+        _check_loaded_deferred(container)
         classes = tuple(_PATCHED_CLASSES.get(id(container), {}).values())
+        skipped = tuple(_DEFERRED)
     # Run outside the global lock: validation may evaluate annotations (imports)
     # and log; neither must happen while patching/refresh could be waiting.
-    _validate_autowiring(container, classes)
+    _validate_autowiring(container, classes, skipped)
 
 
 # ============================================================================
@@ -1112,7 +1227,7 @@ def print_cache_stats():
 
 # Opt-in static analysis; deliberately outside the runtime resolution path.
 
-def _validate_autowiring(container, classes):
+def _validate_autowiring(container, classes, skipped=()):
     # Build a fresh view: validation neither reads nor refreshes the runtime cache.
     registrations = dict(container.registrations)  # snapshot; no nested locks
     earlier = {st: list(regs) for st, regs in getattr(container, "_earlier", {}).items()}
@@ -1268,4 +1383,7 @@ def _validate_autowiring(container, classes):
                 for problem in construction_problems(reg, singleton_owner=singleton_owner):
                     issues.append(f"{label}: registered but unresolvable: {problem}")
     if issues:
-        raise AutowiringValidationError(issues)
+        raise AutowiringValidationError(issues, skipped)
+    if skipped:
+        logger.info("Validation does not cover modules skipped during discovery; "
+                    "they are checked when they load: %s", ", ".join(skipped))

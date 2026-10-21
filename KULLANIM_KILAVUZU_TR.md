@@ -214,7 +214,9 @@ Eşleşen kaydı olmayan alanları, eşit derecede uygun adayları, çözülemey
 bağımlılıklarını, bağımlılık döngülerini ve scoped bir servisi tutacak
 singleton'ları listeler. Yalnız okur, hiçbir servis oluşturmaz. Sonradan tekrar
 kontrol için: `validate_autowiring(container)` (`.issues` içeren
-`AutowiringValidationError` fırlatır).
+`AutowiringValidationError` fırlatır). Tarama sırasında yüklenemeyen bir dosya
+ayrı bir satırda adıyla bildirilir ve yüklendiğinde denetlenir (bkz.
+"Açılıştan sonra yüklenen dosyalar").
 
 ### `Provider[T]` ve `Lazy[T]`
 
@@ -359,10 +361,32 @@ Kütüphane `logging.getLogger("py_autowired")` üzerinden log yazar ve varsayı
 olarak sessizdir. Tarama sorunları WARNING olarak loglanır. Ayrıntılı DEBUG
 çıktısı için import'tan önce `PY_AUTOWIRED_DEBUG=1` ayarlayın.
 
+### Açılıştan sonra yüklenen dosyalar
+
 Uygulama modülü henüz açılırken onu import eden bir proje dosyası (örneğin
-`from app import app` yapan `main.py`) tarama sırasında yüklenemez. Bu bir hata
-değildir: yalnız DEBUG seviyesinde yazılır ve dosya sonradan import edildiğinde
-`*_instance` alanları yine doldurulur.
+`from app import app` yapan `main.py`) tarama sırasında yüklenemez. Bu dosya
+kaybolmaz ve onunla ilgili hiçbir şey gizlenmez:
+
+- açılışta INFO olarak yazılır: `Skipped main during discovery: ... it is checked when it loads`;
+- dosya yüklendiği anda `*_instance` alanları doldurulur **ve denetlenir**
+  (`validate=True` ile aynı denetim). Sorun varsa hemen ERROR yazılır
+  (`validate=True` ise o dosyanın import'u `AutowiringValidationError` ile
+  durur); sorun alan kullanılana kadar beklemez. Sağlam dosya için INFO
+  `Checked main after it loaded ...` yazılır;
+- `skipped_during_discovery()` atlanan adları verir; bir test onları yükleyebilir:
+
+```python
+import importlib
+from py_autowired import skipped_during_discovery
+
+def test_acilista_atlanan_dosyalar_yuklenir_ve_baglanir():
+    import app                                   # uygulama açılır
+    for name in skipped_during_discovery():
+        importlib.import_module(name)            # şimdi denetlenir (validate=True: sorunda hata fırlatır)
+```
+
+`validate_autowiring(container)` de o zamandan beri yüklenmiş atlanan dosyayı
+denetler; henüz yüklenmemiş olanları ayrı bir satırda adıyla bildirir.
 
 ## Notlar
 

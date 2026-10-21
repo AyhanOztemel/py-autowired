@@ -66,7 +66,8 @@ def test_entry_point_importing_loading_app_is_not_a_warning(tmp_path, monkeypatc
     warnings_ = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert warnings_ == [], [r.getMessage() for r in warnings_]
     skipped = [r.getMessage() for r in caplog.records if "still being imported" in r.getMessage()]
-    assert skipped == [f"Skipped {name}.main during discovery: it imports {name}.app_mod, which is still being imported"]
+    assert skipped == [f"Skipped {name}.main during discovery: it imports {name}.app_mod, which is still being imported; "
+                       "it is checked when it loads"]
     # Once the application module has finished, the entry point imports normally.
     sys.modules.pop(f"{name}.main", None)
     assert importlib.import_module(f"{name}.main") is not None

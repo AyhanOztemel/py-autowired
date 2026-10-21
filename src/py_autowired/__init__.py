@@ -10,6 +10,7 @@ from .autowired import (
     get_cache_stats,
     print_cache_stats,
     refresh,
+    skipped_during_discovery,
     validate_autowiring,
 )
 from .container import (
@@ -66,5 +67,6 @@ __all__ = [
     "get_cache_stats",
     "print_cache_stats",
     "refresh",
+    "skipped_during_discovery",
     "validate_autowiring",
 ]
