@@ -211,7 +211,8 @@ auto_inject(container, validate=True)             # console
 ```
 
 Eşleşen kaydı olmayan alanları, eşit derecede uygun adayları, çözülemeyen kurucu
-bağımlılıklarını, bağımlılık döngülerini ve scoped bir servisi tutacak
+bağımlılıklarını (okunamayan imza, çözülemeyen tür ipucu ya da yalnız konumsal
+parametre dahil), taramanın import edemediği ya da yamalayamadığı proje modüllerini, bağımlılık döngülerini ve scoped bir servisi tutacak
 singleton'ları listeler. Yalnız okur, hiçbir servis oluşturmaz. Sonradan tekrar
 kontrol için: `validate_autowiring(container)` (`.issues` içeren
 `AutowiringValidationError` fırlatır). Tarama sırasında yüklenemeyen bir dosya
@@ -235,7 +236,10 @@ class ReportService:
 ```
 
 Bir singleton `Provider[ScopedServis]` tutabilir: her çağrı o anda etkin olan
-scope'tan çözülür.
+scope'tan çözülür. `Lazy[ScopedServis]` tutmamalıdır: `Lazy` ilk değeri saklar,
+singleton da ilk isteğin nesnesini saklamış olur (`validate=True` bunu bildirir).
+Oluşturulmakta olan bir `Lazy` yeniden okunursa donma yerine
+`CircularDependencyError` verir.
 
 ### Bir sözleşmenin birden çok uygulaması
 
@@ -280,7 +284,8 @@ class ReportService:
   uygulama varsa yine `AmbiguousImplementationError` ile durur: py_autowired
   hangisini kastettiğinizi tahmin etmez.
 - `Container(strict_registrations=True)` bir sözleşmenin iki kez kaydedilmesini
-  yasaklar; bu özellik orada kullanılamaz.
+  yasaklar (anahtarlı ve açık generic kayıtlar dahil); bu özellik orada
+  kullanılamaz.
 
 ### Birden çok uygulama arasında seçim: `set_primary`
 
@@ -357,9 +362,25 @@ sonra bir kaydı değiştirirseniz yeni tüketiciler oluşturmadan önce
 
 ### Log ve hata ayıklama çıktısı
 
-Kütüphane `logging.getLogger("py_autowired")` üzerinden log yazar ve varsayılan
-olarak sessizdir. Tarama sorunları WARNING olarak loglanır. Ayrıntılı DEBUG
-çıktısı için import'tan önce `PY_AUTOWIRED_DEBUG=1` ayarlayın.
+Kütüphane `logging.getLogger("py_autowired")` üzerinden log yazar; her şey
+yolundayken hiçbir şey yazmaz. Bir sorunu gizleyebilecek her durum WARNING (ya da
+ERROR) olarak yazılır, hiçbiri yalnız DEBUG'da kalmaz:
+
+- import edilemeyen ya da keşfedilemeyen proje dosyası;
+- eşleşen kaydı olmayan alan (alan başına bir kez; alan `None` kalır);
+- uygulaması olmadan kaydedilmiş ve taramada uygulaması bulunamayan sözleşme;
+- en iyi adayları eşit puanlı alanlar: açılışta TEK bir toplu WARNING; kayıt
+  sırasındaki ilk aday kullanılır (`validate=True` bunları hata sayar). Aynı hazır
+  nesnenin iki kaydı eşitlik değildir; bir factory'nin ne döndüreceği önceden
+  bilinemez, bu yüzden aynı nesneyi döndüren iki factory yine eşitlik sayılır;
+- çözülemeyen kurucu tür ipuçları (varsayılanı olan parametre varsayılanını alır);
+- bir singleton oluşturulurken çözülen scoped servis (singleton onu saklarsa
+  scope'undan uzun yaşar) - çift başına bir kez;
+- import kancasının yamalayamadığı bir yükleyiciyle gelen proje modülü (`tests`
+  gibi dışlanan klasörler hariç);
+- yükleyecek ve yamalayacak hiçbir şey bulamayan `auto_inject()` (`root_dir`'i kontrol edin).
+
+Ayrıntılı DEBUG çıktısı için import'tan önce `PY_AUTOWIRED_DEBUG=1` ayarlayın.
 
 ### Açılıştan sonra yüklenen dosyalar
 
@@ -369,42 +390,61 @@ kaybolmaz ve onunla ilgili hiçbir şey gizlenmez:
 
 - açılışta INFO olarak yazılır: `Skipped main during discovery: ... it is checked when it loads`;
 - dosya yüklendiği anda `*_instance` alanları doldurulur **ve denetlenir**
-  (`validate=True` ile aynı denetim). Sorun varsa hemen ERROR yazılır
-  (`validate=True` ise o dosyanın import'u `AutowiringValidationError` ile
-  durur); sorun alan kullanılana kadar beklemez. Sağlam dosya için INFO
-  `Checked main after it loaded ...` yazılır;
-- `skipped_during_discovery()` atlanan adları verir; bir test onları yükleyebilir:
+  (`validate=True` ile aynı denetim). Sorun hemen ERROR olur; `validate=True`
+  ise o dosyanın import'u `AutowiringValidationError` ile durur. Sağlam dosya
+  için INFO `Checked main after it loaded ...` yazılır;
+- uygulama onu hiç import etmezse (sunucu doğrudan uygulama modülünden
+  başlıyorsa) kütüphane onu ilk güvenli anda kendisi import eder: uygulama modülü
+  yüklenmeyi bitirdikten sonraki ilk alan enjeksiyonu ya da `refresh()`,
+  `activate_container()`, `validate_autowiring()`. Tarama zaten her proje
+  dosyasını import eder; bu aynı import'un sonradan yapılmasıdır;
+- `skipped_during_discovery()` atlanan adları verir; `check_skipped()` hepsini
+  import edip denetler ve `validate` ne olursa olsun her sorunda
+  `AutowiringValidationError` fırlatır:
 
 ```python
-import importlib
-from py_autowired import skipped_during_discovery
+from py_autowired import check_skipped
 
-def test_acilista_atlanan_dosyalar_yuklenir_ve_baglanir():
-    import app                                   # uygulama açılır
-    for name in skipped_during_discovery():
-        importlib.import_module(name)            # şimdi denetlenir (validate=True: sorunda hata fırlatır)
+def test_acilista_atlanan_dosyalar_baglanir():
+    import app            # uygulama açılır
+    check_skipped()       # sorun varsa hata fırlatır
 ```
 
-`validate_autowiring(container)` de o zamandan beri yüklenmiş atlanan dosyayı
-denetler; henüz yüklenmemiş olanları ayrı bir satırda adıyla bildirir.
-
-**Hiç import edilmeyen** atlanmış dosya hiç denetlenmez: bir INFO satırı ve
-`skipped_during_discovery()` içinde bir ad olarak kalır. Sunucunuz doğrudan
-uygulama modülünden başlıyorsa atlanan dosyaları yukarıdaki gibi bir testte
-import edin. Bir dosya, kütüphane meşgulken başka bir thread'de yüklenmeyi
-bitirirse artık o import durdurulamaz: sorun hemen ERROR olarak yazılır ve
-`validate=True` ise sonraki `auto_inject()` ya da `validate_autowiring()` onu
-hata olarak fırlatır.
+Böyle bir dosya, kütüphane meşgulken başka bir thread'de yüklenmeyi bitirirse
+artık o import durdurulamaz: sorun hemen ERROR olur ve `validate=True` ise sonraki
+kütüphane çağrısı (`refresh()`, `activate_container()`, `auto_inject()`,
+`validate_autowiring()` ya da sonraki enjeksiyon) kendi işini bitirdikten sonra
+onu fırlatır. Henüz yüklenmemiş atlanmış dosyayı `validate_autowiring()` ayrı
+bir satırda adıyla bildirir.
 
 ## Notlar
 
 - **Eşzamanlılık:** hazır singleton'lar ve önbellek okumaları kilitsizdir. Bir
   bağımlılık döngüsü, iki thread aynı anda çarpsa bile donma yerine
-  `CircularDependencyError` verir. Testler GIL'siz CPython 3.14t'de de koşar.
+  `CircularDependencyError` verir. Her scoped servis kendi kapısı altında
+  oluşturulur; bir factory, aynı scope'un başka bir scoped servisine ihtiyaç
+  duyan bir worker thread'i bekleyebilir. Bilinen sınır: factory, tam da
+  oluşturmakta olduğu servise ihtiyaç duyan bir worker'ı (ör. `thread.join()` ile)
+  beklerse sonsuza dek bekler - bu beklemeyi hiçbir kilit göstermez; singleton'da
+  da scoped'da da aynıdır. Sessiz değildir: bir oluşturma kapısında
+  `container.creation_wait_warning` saniyeden (varsayılan 10) uzun bekleyen thread
+  iki thread'i de adlandıran bir WARNING yazar - kendisi oluşturma kilidi
+  tutmuyorsa hemen, tutuyorsa onları bıraktığında. Testler GIL'siz CPython
+  3.14t'de de koşar.
+- **Flask/Django köprülerinde kapanış:** container'ın oluşturduğu singleton'lar
+  süreç çıkışında kapatılır; yalnız `aclose()` olanı kısa bir olay döngüsünde
+  kapatılır.
 - **Süreç başına bir container:** sınıf yamaları süreç geneline uygulanır; ayrı
   uygulamaları ayrı süreçlerde çalıştırın.
 - **Tarama modülleri import eder:** proje klasörü altındaki modüller import
-  edilir. Import edilmemesi gereken klasörler için `exclude_dirs` kullanın.
+  edilir. Import edilmemesi gereken klasörler için `exclude_dirs` kullanın. Proje
+  içinde tutulan bir kütüphane kopyası (vendor) ya da ikinci bir kurulum adıyla
+  dışlanmalıdır: `auto_inject(container, exclude_dirs=["vendor", "third_party"])`.
+- **Hangi ad alan sayılır:** `_instance`/`_instances` ile biten ve değer
+  alabilen ad - sınıf değişkeni, açıklama (annotation), `self.x_instance = ...`
+  ataması, `__slots__`/attrs/dataclass alanı ya da ayarlayıcısı (setter) olan
+  property. Bu adla biten bir metot ya da salt-okunur property (`has_instance`)
+  alan değildir.
   Proje içindeki `tests` ve `examples` klasörleri kendiliğinden atlanır.
 - **`resolve()` senkrondur:** ham coroutine döndüren fabrika
   `AsyncFactoryError` verir.

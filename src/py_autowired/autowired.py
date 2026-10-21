@@ -18,7 +18,7 @@ from collections import defaultdict
 from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Any, Tuple, get_type_hints
 
-from .container import DependencyInjectionError, LifetimeScope, _deferred_wrapper, _keyed_marker, _parameter_hint, _slot_name, _unwrap_annotation
+from .container import DependencyInjectionError, Lazy, LifetimeScope, _deferred_wrapper, _keyed_marker, _parameter_hint, _slot_name, _unwrap_annotation, _warn_once
 
 # ============================================================================
 # CONFIGURATION
@@ -56,19 +56,87 @@ _GLOBAL_LOCK = threading.RLock()
 _PATCHED_CLASSES = {}
 
 
-def _forget_patched_classes(key):
+_FORGOTTEN: list = []  # (store, key, value) of containers collected while the lock was busy
+
+
+def _forget(store, key, value):
+    """Finalizer of a collected container. The garbage collector runs it in any
+    thread - maybe while another thread holds the lock and waits for this one -
+    so it never waits for the lock; the next lock holder finishes the job."""
+    if _GLOBAL_LOCK.acquire(blocking=False):
+        try:
+            _drop(store, key, value)
+        finally:
+            _GLOBAL_LOCK.release()
+    else:
+        _FORGOTTEN.append((store, key, value))
+
+
+def _drop(store, key, value):
+    # id() values are reused: drop the entry only if it still belongs to the
+    # collected container, never the entry of a newer container with that id.
+    if store.get(key) is value:
+        del store[key]
+
+
+def _forget_patched_classes(key, classes):
+    _forget(_PATCHED_CLASSES, key, classes)
+
+
+def _forget_untracked(key, entries):
+    _forget(_UNTRACKED, key, entries)
+
+
+_UNTRACKED: Dict[int, List[str]] = {}  # id(container) -> issues validation must report
+
+
+def _record_issue(container, text: str) -> None:
+    """An issue validate_autowiring() reports for ``container``; dropped with it."""
     with _GLOBAL_LOCK:
-        _PATCHED_CLASSES.pop(key, None)
+        _forget_collected()
+        key = id(container)
+        entries = _UNTRACKED.get(key)
+        if entries is None:
+            entries = _UNTRACKED[key] = []
+            try:
+                weakref.finalize(container, _forget_untracked, key, entries)
+            except TypeError:
+                pass  # a non-weakrefable container keeps its entries
+        if text not in entries:
+            entries.append(text)
+
+
+def _track(container, cls) -> None:
+    """Remember ``cls`` for validation. A failure is never silent: it is a
+    WARNING now and an issue in validate_autowiring()."""
+    try:
+        _remember_patched_class(container, cls)
+    except Exception as error:
+        label = f"{getattr(cls, '__module__', '?')}.{getattr(cls, '__qualname__', cls)}"
+        error = repr(error)  # text only: a kept log record must not keep the container alive
+        logger.warning("%s could not be tracked for validation; validate_autowiring() reports it: %s",
+                       label, error)
+        _record_issue(container, f"{label}: could not be tracked for validation ({error})")
+
+
+def _forget_collected() -> None:
+    """Finish the finalizers that found the lock busy. Caller holds the lock."""
+    while _FORGOTTEN:
+        try:
+            _drop(*_FORGOTTEN.pop())
+        except IndexError:
+            break
 
 
 def _remember_patched_class(container, cls):
     # Identity keys avoid hashing containers or classes with custom metaclasses.
     with _GLOBAL_LOCK:
+        _forget_collected()
         key = id(container)
         if key not in _PATCHED_CLASSES:
             _PATCHED_CLASSES[key] = weakref.WeakValueDictionary()
             try:
-                weakref.finalize(container, _forget_patched_classes, key)
+                weakref.finalize(container, _forget_patched_classes, key, _PATCHED_CLASSES[key])
             except TypeError:
                 # A non-weakrefable duck-typed container remains supported.
                 # Live class wrappers already hold their container by identity.
@@ -369,6 +437,8 @@ def _lookup_registration(container, name_map, normalized_name: str, context_modu
     controlled runtime rebuilds. Looking up from the new cache but resolving
     through the old closure would mix two object graphs.
     """
+    if _AWAITING:  # one dict check; empty once skipped files have loaded
+        _load_skipped()
     cache = _NAME_MAP_CACHE
     if cache is not None:
         return (
@@ -422,7 +492,21 @@ def _find_di_candidates(cls) -> tuple:
             if _DEF_ATTR_RE.match(instruction.argval):
                 candidates.add(instruction.argval)
 
-    return tuple(sorted(candidates))
+    # A method, property or other descriptor with a field-like name (for example
+    # a ``has_instance`` property) is not a field: injection must not touch it.
+    return tuple(sorted(name for name in candidates if not _is_accessor(cls, name)))
+
+
+def _is_accessor(cls, name: str) -> bool:
+    """True for a name that can never receive an injected value."""
+    value = inspect.getattr_static(cls, name, None)
+    if value is None or not hasattr(type(value), "__get__"):
+        return False  # a plain class value: a field
+    if isinstance(value, property):
+        return value.fset is None  # read-only: an assignment would always fail
+    # Methods (and other descriptors without __set__) are not fields; data
+    # descriptors such as __slots__ members or attrs fields are.
+    return not hasattr(type(value), "__set__")
 
 
 def _patch_setattr(cls, container, name_map):
@@ -485,10 +569,7 @@ def _patch_init(cls, container, name_map):
     Post-init injection for remaining None attributes.
     """
     # 🆕 v2 FIX: getattr yerine cls.__dict__ — kalıtım bug'ı düzeltmesi
-    try:
-        _remember_patched_class(container, cls)
-    except Exception as exc:  # opt-in validation bookkeeping must never break patching
-        logger.debug(f"Validation tracking skipped for {cls!r}: {exc}")
+    _track(container, cls)  # bookkeeping never breaks patching, and never fails silently
     if cls.__dict__.get("__ai_ioc_init__", False):
         return
 
@@ -502,13 +583,8 @@ def _patch_init(cls, container, name_map):
         cls.__di_attrs__ = di_candidates
 
     def __init__(self, *args, **kwargs):
-        if callable(orig_init):
-            orig_init(self, *args, **kwargs)
-        else:
-            try:
-                super(cls, self).__init__()
-            except Exception:
-                pass
+        # A non-callable __init__ fails exactly as it would without the patch.
+        orig_init(self, *args, **kwargs)
 
         # 🆕 v2: dir(self) yerine önceden hesaplanmış aday listesi
         for attr in di_candidates:
@@ -516,7 +592,7 @@ def _patch_init(cls, container, name_map):
                 val = getattr(self, attr)
             except Exception:
                 logger.warning(
-                    "Field read failed for %s.%s.%s; field skipped",
+                    "Field read failed for %s.%s.%s; field skipped (it keeps its current value)",
                     cls.__module__, cls.__qualname__, attr, exc_info=True,
                 )
                 continue
@@ -534,12 +610,13 @@ def _patch_init(cls, container, name_map):
             )
 
             if not reg:
-                if DEBUG_MODE:
-                    logger.debug(f"No registration found for {normalized_base!r}")
+                _warn_once(("unregistered", cls.__module__, cls.__qualname__, attr),
+                           "%s.%s.%s: no matching registration; the field stays None",
+                           cls.__module__, cls.__qualname__, attr)
                 continue
 
             try:
-                injected = _resolve_via_container(resolution_container, reg)
+                injected = _resolve_via_container(resolution_container, reg, isinstance(normalized_base, tuple))
                 setattr(self, attr, injected)
                 if DEBUG_MODE:
                     impl = (reg.implementation_type or reg.service_type).__name__
@@ -654,7 +731,10 @@ def _still_importing(error: BaseException) -> Optional[str]:
 # is not lost: it is listed, and checked the moment it loads (_check_deferred).
 _DISCOVERING: list = []          # one list per running discovery (calls can nest)
 _SKIPPED: Tuple[str, ...] = ()   # what the latest discovery skipped
+_BLOCKERS: Dict[str, str] = {}   # ... and the module each of them waited for
+_FAILED: Tuple[str, ...] = ()    # what the latest discovery could not import (issue texts)
 _DEFERRED: Dict[str, bool] = {}  # skipped, not checked yet -> validate flag of its auto_inject()
+_AWAITING: Dict[str, str] = {}   # skipped, not loaded yet -> the module it waits for
 
 
 def _is_loading(module) -> bool:
@@ -681,6 +761,9 @@ def _import_module_safely(dotted_name: str, file_path: str) -> bool:
                 "Module origin mismatch for %s: expected %s, imported %s",
                 dotted_name, Path(file_path).resolve(), actual,
             )
+            if _DISCOVERING:
+                _DISCOVERING[-1]["failed"].append(
+                    f"{dotted_name}: not loaded during discovery, another module with that name was imported ({actual})")
             return False
         return True
     except Exception as e:
@@ -694,9 +777,11 @@ def _import_module_safely(dotted_name: str, file_path: str) -> bool:
                 dotted_name, importing,
             )
             if _DISCOVERING:
-                _DISCOVERING[-1].append(dotted_name)
+                _DISCOVERING[-1]["skipped"].append((dotted_name, importing))
             return False
         logger.warning(f"Import failed for {dotted_name}: {e}")
+        if _DISCOVERING:
+            _DISCOVERING[-1]["failed"].append(f"{dotted_name}: could not be imported during discovery ({e!r})")
         return False
 
 
@@ -710,14 +795,16 @@ def _normalize_excluded_dirs(exclude_dirs: Optional[Iterable[str]]) -> frozenset
 
 def _discover_and_load_modules(root: Path, exclude_dirs: Optional[Iterable[str]] = None) -> int:
     """Load the project's modules; remember the ones skipped as still loading."""
-    global _SKIPPED
-    skipped = []
-    _DISCOVERING.append(skipped)
+    global _SKIPPED, _BLOCKERS, _FAILED
+    frame = {"skipped": [], "failed": []}
+    _DISCOVERING.append(frame)
     try:
         return _load_project_modules(root, exclude_dirs)
     finally:
         _DISCOVERING.pop()
-        _SKIPPED = tuple(sorted(set(skipped)))  # the same order on every file system
+        _BLOCKERS = dict(frame["skipped"])
+        _SKIPPED = tuple(sorted(_BLOCKERS))  # the same order on every file system
+        _FAILED = tuple(frame["failed"])
 
 
 def _load_project_modules(root: Path, exclude_dirs: Optional[Iterable[str]] = None) -> int:
@@ -789,8 +876,7 @@ def _load_project_modules(root: Path, exclude_dirs: Optional[Iterable[str]] = No
                 logger.debug(f"File outside root directory: {p}")
             skipped.append((str(p), "outside root"))
         except Exception as e:
-            if DEBUG_MODE:
-                logger.debug(f"Module path error ({p}): {e}")
+            logger.warning("%s was not discovered: %s", p, e)
             skipped.append((str(p), f"error: {e}"))
 
     if DEBUG_MODE:
@@ -830,10 +916,7 @@ def _patch_module_classes(mod, container, name_map) -> int:
             if not candidates:
                 # Include skipped classes in opt-in diagnostics without
                 # installing any new injection wrapper or field candidate.
-                try:
-                    _remember_patched_class(container, cls)
-                except Exception:  # bookkeeping must never break patching
-                    pass
+                _track(container, cls)
                 if DEBUG_MODE:
                     logger.debug(f"Skipped {cls.__name__} (no injection candidates)")
                 continue
@@ -867,13 +950,28 @@ def _is_late_root_path(path: str) -> bool:
     return any(candidate.startswith(root) for root in _LATE_ROOTS)
 
 
-def _remember_late_root(root: Path) -> None:
+def _in_excluded_folder(path: str) -> bool:
+    """True when a late-root file lies in a folder discovery skips (tests, venv, ...)."""
+    candidate = os.path.normcase(os.path.abspath(path))
+    for root in _LATE_ROOTS:
+        if candidate.startswith(root):
+            folders = candidate[len(root):].split(os.sep)[:-1]
+            if _LATE_EXCLUDED.get(root, frozenset()).intersection(folders):
+                return True
+    return False
+
+
+_LATE_EXCLUDED: Dict[str, frozenset] = {}  # root prefix -> folder names discovery skips there
+
+
+def _remember_late_root(root: Path, excluded: Iterable[str] = ()) -> None:
     for form in (str(root), os.path.abspath(str(root))):
         prefix = os.path.normcase(form)
         if not prefix.endswith(os.sep):
             prefix += os.sep
         if prefix not in _LATE_ROOTS:
             _LATE_ROOTS.append(prefix)
+        _LATE_EXCLUDED[prefix] = _LATE_EXCLUDED.get(prefix, frozenset()).union(excluded)
     if not any(isinstance(finder, _LateImportFinder) for finder in sys.meta_path):
         sys.meta_path.insert(0, _LateImportFinder())
 
@@ -927,6 +1025,54 @@ def _check_loaded_deferred(container, name_map=None):
     return failure
 
 
+def _raise_first(failed: dict) -> None:
+    """Raise the first validate=True failure, after the caller's own work is done."""
+    for error in failed.values():
+        raise error
+
+
+def _load_skipped() -> None:
+    """Import skipped modules whose blocking module has finished loading.
+
+    Runs at the first injection, refresh(), activate_container() or
+    validate_autowiring() after that point, so a skipped file is checked even
+    when the application never imports it. Discovery imports every project
+    file anyway; this is the same import, only later. The import itself runs
+    outside the lock; the import hook patches and checks the module.
+    """
+    ready = [name for name, blocker in list(_AWAITING.items()) if _has_loaded(blocker)]  # lock-free
+    if not ready:
+        return
+    with _GLOBAL_LOCK:
+        # Another thread may have taken some of them meanwhile: keep only ours.
+        ready = [name for name in ready if _AWAITING.pop(name, None) is not None]
+    failure = None
+    for name in ready:
+        if name in sys.modules:
+            continue  # the application imported it: already checked on load
+        try:
+            importlib.import_module(name)
+        except AutowiringValidationError as error:
+            failure = failure or error
+        except Exception as error:
+            logger.warning(f"Import failed for {name}: {error}")
+            cache = _NAME_MAP_CACHE
+            if cache is not None:
+                _record_issue(cache._container, f"{name}: could not be imported after startup ({error!r})")
+    with _GLOBAL_LOCK:
+        cache = _NAME_MAP_CACHE
+        if cache is not None:
+            # Loaded without passing the hook (e.g. during another auto_inject()).
+            failure = failure or _check_loaded_deferred(cache._container)
+    if failure is not None:
+        raise failure
+
+
+def _has_loaded(name: str) -> bool:
+    module = sys.modules.get(name)
+    return module is not None and not _is_loading(module)
+
+
 def _drain_late_modules() -> dict:
     """Patch modules that were imported while the lock was busy. Caller holds the lock.
 
@@ -944,8 +1090,11 @@ def _drain_late_modules() -> dict:
             break
         try:
             _patch_module_classes(module, cache._container, name_map)
-        except Exception:
-            logger.warning("Could not patch late-imported module %s", module.__name__, exc_info=True)
+        except Exception as error:
+            # Its classes stay unpatched (their fields stay None): an error, and a
+            # validation issue, not a passing note.
+            logger.error("Could not patch late-imported module %s", module.__name__, exc_info=True)
+            _record_issue(cache._container, f"{module.__name__}: could not be patched ({error!r})")
         error = _check_deferred(module, cache._container, name_map)
         if error is not None:
             failed[module.__name__] = error
@@ -963,6 +1112,8 @@ def _patch_late_module(module) -> None:
     # very import; the module is then queued for the next lock holder.
     if not _GLOBAL_LOCK.acquire(timeout=0.5):
         _PENDING_LATE_MODULES.append(module)
+        # No other lock holder may ever come: finish it as soon as the lock is free.
+        threading.Thread(target=_drain_when_free, name="py_autowired-late-import", daemon=True).start()
         return
     try:
         _PENDING_LATE_MODULES.append(module)
@@ -971,6 +1122,13 @@ def _patch_late_module(module) -> None:
         _GLOBAL_LOCK.release()
     if error is not None:
         raise error  # validate=True: this import fails, like a failed startup check
+
+
+def _drain_when_free() -> None:
+    """Patch (and check) queued late imports once the lock is free. Problems are
+    logged; a validate=True failure stays pending for the next library call."""
+    with _GLOBAL_LOCK:
+        _drain_late_modules()
 
 
 class _LateImportLoader(importlib.machinery.SourceFileLoader):
@@ -997,9 +1155,14 @@ class _LateImportFinder(importlib.abc.MetaPathFinder):
         else:
             return None
         loader = spec.loader
-        if (type(loader) is importlib.machinery.SourceFileLoader
-                and spec.origin and _is_late_root_path(spec.origin)):
-            spec.loader = _LateImportLoader(loader.name, loader.path)
+        if spec.origin and _is_late_root_path(spec.origin):
+            if type(loader) is importlib.machinery.SourceFileLoader:
+                spec.loader = _LateImportLoader(loader.name, loader.path)
+            elif spec.origin.endswith((".py", ".pyc")) and not _in_excluded_folder(spec.origin):
+                # Behaviour is unchanged (the module is not patched), but never silently.
+                _warn_once(("loader", fullname),
+                           "%s is imported by %s, which py_autowired cannot hook; its classes are "
+                           "not patched", fullname, type(loader).__name__)
         return spec
 
 
@@ -1013,7 +1176,7 @@ def _startup_patching(func):
             result = func(*args, **kwargs)
         finally:
             _STARTUP.active = previous
-        _drain_late_modules()
+        _raise_first(_drain_late_modules())
         return result
 
     return run
@@ -1070,7 +1233,7 @@ def auto_inject(
 
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
-    _remember_late_root(root)
+    _remember_late_root(root, _normalize_excluded_dirs(exclude_dirs))
 
     if DEBUG_MODE:
         logger.debug(f"Root directory: {root}")
@@ -1083,21 +1246,16 @@ def auto_inject(
         loaded_count = _discover_and_load_modules(root, exclude_dirs)
     for name in _SKIPPED:
         _DEFERRED[name] = validate
-
-    if loaded_count == 0 and DEBUG_MODE:
-        logger.debug("No modules could be loaded")
-        logger.debug("Possible causes:")
-        logger.debug("1. Incorrect project root")
-        logger.debug("2. No Python files found")
-        logger.debug("3. All imports failed")
-        logger.debug("Set root_dir explicitly:")
-        logger.debug("auto_inject(container, root_dir='/absolute/path/to/project')")
+        _AWAITING[name] = _BLOCKERS[name]
+    for text in _FAILED:
+        _record_issue(container, text)  # discovery was incomplete: validation says so
 
     # Interfaces registered before their implementation module was imported
     # get it now, so the name map and validation see it.
     complete_implementations = getattr(container, "_complete_implementations", None)
     if complete_implementations is not None:
         complete_implementations()
+    _warn_missing_implementations(container)
 
     # Build cached name map
     global _NAME_MAP_CACHE
@@ -1116,9 +1274,11 @@ def auto_inject(
 
         try:
             mod_path = Path(mod.__file__).resolve()
-            if not _is_rel_to(mod_path, root):
-                continue
-        except Exception:
+        except Exception as error:
+            logger.warning("The path of module %s cannot be read (%r); if it belongs to the "
+                           "project, its classes are not patched", mod_name, error)
+            continue
+        if not _is_rel_to(mod_path, root):
             continue
 
         if DEBUG_MODE:
@@ -1131,6 +1291,10 @@ def auto_inject(
         logger.debug("Autowiring complete")
         logger.debug(f"Loaded {loaded_count} modules; patched {patched} classes")
         logger.debug("=" * 60)
+    if loaded_count == 0 and patched == 0:
+        logger.warning("Nothing to inject: no project module was loaded from %s and no class "
+                       "was patched; check root_dir", root)
+    _warn_equal_candidates(container, name_map)
 
     # A skipped module that loaded while this call ran (during its discovery)
     # did not pass through the import hook: check it now.
@@ -1142,6 +1306,84 @@ def auto_inject(
     return patched
 
 
+def _field_candidates(name_map, name):
+    """Registrations a field can receive, narrowed like runtime selection."""
+    unique = {}
+    for reg in name_map.get(_field_key(name), ()):
+        # Alias/index duplicates are not ambiguity, and neither are two
+        # registrations of the SAME ready object (register_instance(A, obj) +
+        # register_instance(B, obj)): every candidate gives the field that object.
+        target = ("object", id(reg.instance)) if getattr(reg, "has_instance", False) else id(reg)
+        unique.setdefault(target, reg)
+    regs = list(unique.values())
+    primaries = [reg for reg in regs if getattr(reg, "primary", False)]
+    return primaries or regs
+
+
+def _tied_candidates(regs, module):
+    best = max(_registration_score(reg, module) for reg in regs)
+    return [reg for reg in regs if _registration_score(reg, module) == best]
+
+
+def _registration_label(reg) -> str:
+    target = reg.implementation_type or reg.service_type
+    return f"{target.__module__}.{target.__qualname__}"
+
+
+_UNSET = object()
+
+
+def _open_fields(cls):
+    """Fields of ``cls`` that injection fills (a concrete class value satisfies one)."""
+    for name in cls.__dict__.get("__di_attrs__", ()):
+        value = inspect.getattr_static(cls, name, _UNSET)
+        # Do not invoke descriptors; constructor assignments cannot be known statically.
+        if value is not _UNSET and value is not None and not inspect.isdatadescriptor(value):
+            continue
+        yield name
+
+
+def _warn_equal_candidates(container, name_map) -> None:
+    """ONE startup WARNING listing every field whose best candidates tie.
+
+    Runtime then takes the first registered one; validate=True reports the same
+    fields as errors. Grouped so a project with many ties gets one entry.
+    """
+    with _GLOBAL_LOCK:
+        classes = tuple(_PATCHED_CLASSES.get(id(container), {}).values())
+    lines = []
+    for cls in sorted(classes, key=lambda c: (c.__module__, c.__qualname__)):
+        for name in _open_fields(cls):
+            regs = _field_candidates(name_map, name)
+            if len(regs) < 2:
+                continue
+            tied = _tied_candidates(regs, cls.__module__)
+            if len(tied) > 1:
+                lines.append(f"{cls.__module__}.{cls.__qualname__}.{name}: "
+                             + ", ".join(_registration_label(reg) for reg in tied))
+    if lines:
+        logger.warning("%d fields have equally good candidates; the first registered one is used:\n%s",
+                       len(lines), "\n".join(f"- {line}" for line in lines))
+
+
+def _warn_missing_implementations(container) -> None:
+    """A contract still without an implementation after discovery is a WARNING now,
+    not only an error at its first resolve()."""
+    seen = set()
+    for reg in (*getattr(container, "registrations", {}).values(),
+                *getattr(container, "_keyed", {}).values()):
+        if id(reg) in seen:
+            continue
+        seen.add(id(reg))
+        if (getattr(reg, "implementation_type", None) is None
+                and getattr(reg, "factory", None) is None
+                and not getattr(reg, "has_instance", False)
+                and inspect.isabstract(reg.service_type)):
+            logger.warning("%s.%s is registered with no implementation and none was found in the "
+                           "project; resolve() looks again and fails if there is still none",
+                           reg.service_type.__module__, reg.service_type.__qualname__)
+
+
 def validate_autowiring(container) -> None:
     """Startup checks for this container's patched classes.
 
@@ -1149,16 +1391,20 @@ def validate_autowiring(container) -> None:
     descriptors, or open scopes. It may evaluate type annotations, which can
     execute user code. It cannot predict arbitrary constructor/factory behavior.
     A module skipped during discovery that has loaded since is patched and
-    checked first; one that has not loaded yet is named on a line of its own.
+    checked first, and one whose blocking module has finished is imported now;
+    one that still cannot load is named on a line of its own.
     """
+    _load_skipped()
     with _GLOBAL_LOCK:
         # A skipped module may have loaded around the import hook: check it first.
         _check_loaded_deferred(container)
+        _forget_collected()  # a collected container's list must not pass for this one's
         classes = tuple(_PATCHED_CLASSES.get(id(container), {}).values())
         skipped = tuple(_DEFERRED)
+        untracked = tuple(_UNTRACKED.get(id(container), ()))
     # Run outside the global lock: validation may evaluate annotations (imports)
     # and log; neither must happen while patching/refresh could be waiting.
-    _validate_autowiring(container, classes, skipped)
+    _validate_autowiring(container, classes, skipped, untracked)
 
 
 # ============================================================================
@@ -1180,13 +1426,16 @@ def refresh():
     """
     global _NAME_MAP_CACHE
     with _GLOBAL_LOCK:
-        if _NAME_MAP_CACHE is not None:
-            _NAME_MAP_CACHE.refresh()
-            _drain_late_modules()
-            if DEBUG_MODE:
-                logger.debug("Name map refreshed; resolution cache cleared")
-            return True
-    return False
+        if _NAME_MAP_CACHE is None:
+            return False
+        _NAME_MAP_CACHE.refresh()
+        failed = _drain_late_modules()
+        if DEBUG_MODE:
+            logger.debug("Name map refreshed; resolution cache cleared")
+    # The refresh is complete; now report what the drained imports found.
+    _raise_first(failed)
+    _load_skipped()
+    return True
 
 
 def activate_container(container) -> None:
@@ -1202,7 +1451,54 @@ def activate_container(container) -> None:
     with _GLOBAL_LOCK:
         if _NAME_MAP_CACHE is None or _NAME_MAP_CACHE._container is not container:
             _NAME_MAP_CACHE = _CachedNameMap(container)
-        _drain_late_modules()
+        failed = _drain_late_modules()
+    # The container is active; now report what the drained imports found.
+    _raise_first(failed)
+    _load_skipped()
+
+
+def check_skipped(container=None) -> Tuple[str, ...]:
+    """Import and check every module the latest discovery skipped.
+
+    For tests and startup checks. Unlike the automatic check it raises
+    AutowiringValidationError for any problem whatever ``validate`` was, and it
+    also reports a module that was already checked (and logged) earlier.
+    ``container`` defaults to the active one. Returns the checked module names.
+    """
+    if container is None:
+        cache = _NAME_MAP_CACHE
+        if cache is None:
+            raise DependencyInjectionError("check_skipped() needs a container: auto_inject() has not run")
+        container = cache._container
+    names = _SKIPPED
+    issues = []
+    for name in names:
+        try:
+            module = importlib.import_module(name)
+        except AutowiringValidationError as error:
+            issues.extend(error.issues)
+            continue
+        except Exception as error:
+            issues.append(f"{name}: could not be imported: {error!r}")
+            continue
+        if _is_loading(module):
+            issues.append(f"{name}: is still being imported; call check_skipped() after startup")
+            continue
+        try:
+            with _GLOBAL_LOCK:
+                name_map = _build_name_map_from_container(container)
+                _check_deferred(module, container, name_map)  # logs, if still pending
+                _patch_module_classes(module, container, name_map)
+            _validate_autowiring(container, [
+                cls for _, cls in inspect.getmembers(module, inspect.isclass)
+                if getattr(cls, "__module__", None) == name])
+        except AutowiringValidationError as error:
+            issues.extend(error.issues)
+        except Exception as error:
+            issues.append(f"{name}: could not be checked: {error!r}")
+    if issues:
+        raise AutowiringValidationError(issues)
+    return names
 
 # ============================================================================
 # BONUS: Performance monitoring utilities
@@ -1229,12 +1525,11 @@ def print_cache_stats():
 
 # Opt-in static analysis; deliberately outside the runtime resolution path.
 
-def _validate_autowiring(container, classes, skipped=()):
+def _validate_autowiring(container, classes, skipped=(), untracked=()):
     # Build a fresh view: validation neither reads nor refreshes the runtime cache.
     registrations = dict(container.registrations)  # snapshot; no nested locks
     earlier = {st: list(regs) for st, regs in getattr(container, "_earlier", {}).items()}
     name_map = _build_name_map_from_container(container)
-    missing = object()
 
     def targets(regs, name):
         # A plural field receives every registration of the matched contract.
@@ -1242,22 +1537,10 @@ def _validate_autowiring(container, classes, skipped=()):
             return regs
         return [item for reg in regs for item in (*earlier.get(reg.service_type, ()), reg)]
 
-    def fields(cls):
-        for name in cls.__dict__.get("__di_attrs__", ()):
-            value = inspect.getattr_static(cls, name, missing)
-            # A concrete class-level override is already satisfied. Do not invoke
-            # descriptors; constructor assignments cannot be known statically.
-            if value is not missing and value is not None and not inspect.isdatadescriptor(value):
-                continue
-            yield name
+    fields = _open_fields
 
     def candidates(cls, name):
-        unique = {}
-        for reg in name_map.get(_field_key(name), ()):
-            unique[id(reg)] = reg  # alias/index duplicates are not ambiguity
-        regs = list(unique.values())
-        primaries = [reg for reg in regs if getattr(reg, "primary", False)]
-        return primaries or regs  # same narrowing as runtime selection
+        return _field_candidates(name_map, name)
 
     def construction_problems(reg, path=(), singleton_owner=None, lifetime_only=False):
         service = reg.service_type
@@ -1289,9 +1572,19 @@ def _validate_autowiring(container, classes, skipped=()):
             return [f"{impl.__name__} is abstract"]
         try:
             signature = inspect.signature(impl.__init__)
-        except (TypeError, ValueError):
-            # An opaque callable is unknown, not proof of a broken graph.
-            return []
+        except (TypeError, ValueError) as error:
+            if lifetime_only:
+                return []
+            if getattr(impl, "__di_attrs__", ()):
+                # The container builds a field-injection class without arguments
+                # and without reading the signature: it cannot be checked here.
+                _warn_once(("signature", impl.__module__, impl.__qualname__),
+                           "%s.%s: constructor signature cannot be read (%r); it is built "
+                           "without arguments and cannot be validated",
+                           impl.__module__, impl.__qualname__, error)
+                return []
+            # The container reads the same signature and fails on it.
+            return [f"{impl.__name__}: constructor signature cannot be read ({error!r})"]
         parameters = [p for p in list(signature.parameters.values())[1:] if p.kind not in {
             inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD,
         }]
@@ -1300,36 +1593,66 @@ def _validate_autowiring(container, classes, skipped=()):
         if not (getattr(impl, "__di_attrs__", ()) and all(
             p.default is not inspect.Parameter.empty for p in parameters
         )):
+            hint_error = None
             try:
                 hints = get_type_hints(impl.__init__)
-            except (NameError, TypeError, ValueError):
-                hints = {}
+            except (NameError, TypeError, ValueError) as error:
+                hints, hint_error = {}, error
             try:
                 extras = get_type_hints(impl.__init__, include_extras=True)
             except (NameError, TypeError, ValueError):
                 extras = {}
             keyed_registrations = getattr(container, "_keyed", {})
             for parameter in parameters:
+                # The container passes arguments by name: a positional-only one fails.
+                positional_only = (parameter.kind is inspect.Parameter.POSITIONAL_ONLY
+                                   and not lifetime_only)
+                positional_issue = (f"{impl.__name__}.{parameter.name} is positional-only; "
+                                    "the container passes arguments by name")
                 keyed = _keyed_marker(extras.get(parameter.name, parameter.annotation))
                 if keyed is not None:
                     child = keyed_registrations.get(keyed)
-                    if child is not None:
+                    if child is not None and positional_only:
+                        problems.append(positional_issue)
+                    elif child is not None:
                         problems.extend(construction_problems(child, path, singleton_owner, lifetime_only))
                     elif not lifetime_only and parameter.default is inspect.Parameter.empty:
                         problems.append(f"{impl.__name__}.{parameter.name} requires unregistered keyed {keyed!r}")
                     continue
                 annotation = _unwrap_annotation(_parameter_hint(parameter, hints))
+                if hint_error is not None and isinstance(annotation, str):
+                    # The container cannot resolve it either: without a default it
+                    # fails, with one the default silently replaces injection.
+                    if parameter.default is not inspect.Parameter.empty:
+                        _warn_once(("hint", impl.__module__, impl.__qualname__, parameter.name),
+                                   "%s.%s: type hint %r cannot be resolved (%s: %s); the default "
+                                   "value is used instead of injection",
+                                   impl.__name__, parameter.name, annotation,
+                                   type(hint_error).__name__, hint_error)
+                    elif not lifetime_only:
+                        problems.append(f"{impl.__name__}.{parameter.name}: type hint cannot be resolved "
+                                        f"({annotation!r}: {type(hint_error).__name__}: {hint_error})")
+                    continue
                 deferred = _deferred_wrapper(annotation)
                 if deferred is not None:
-                    # Provider[X]/Lazy[X] defer resolution: never a capture,
-                    # only the inner registration must exist.
+                    # Provider[X] defers every resolution: never a capture. Lazy[X]
+                    # keeps the first value: in a singleton that is a capture.
                     if not lifetime_only and deferred[1] not in registrations:
                         problems.append(f"{impl.__name__}.{parameter.name} defers an unregistered dependency ({deferred[1]!r})")
+                    inner = registrations.get(deferred[1])
+                    if (deferred[0] is Lazy and singleton_owner is not None and inner is not None
+                            and inner.scope == LifetimeScope.SCOPED):
+                        problems.append(f"singleton {singleton_owner.__name__} captures scoped "
+                                        f"{inner.service_type.__name__} through Lazy (it keeps the first value)")
+                    if positional_only:
+                        problems.append(positional_issue)
                     continue
                 child = registrations.get(annotation)
                 if child is None and hasattr(container, "_closed_generic_registration"):
                     child = container._closed_generic_registration(annotation, cache=False)
-                if annotation is not inspect.Parameter.empty and child is not None:
+                if annotation is not inspect.Parameter.empty and child is not None and positional_only:
+                    problems.append(positional_issue)
+                elif annotation is not inspect.Parameter.empty and child is not None:
                     problems.extend(construction_problems(child, path, singleton_owner, lifetime_only))
                 elif (not lifetime_only and annotation is inspect.Parameter.empty
                       and parameter.default is inspect.Parameter.empty):
@@ -1363,6 +1686,7 @@ def _validate_autowiring(container, classes, skipped=()):
                            "this class's post-init injection", cls.__module__, cls.__qualname__, name)
         singleton_owner = next((reg.service_type for reg in (
                                     *registrations.values(),
+                                    *getattr(container, "_keyed", {}).values(),
                                     *(item for items in earlier.values() for item in items))
                                 if reg.scope == LifetimeScope.SINGLETON
                                 and reg.implementation_type is cls), None)
@@ -1372,18 +1696,14 @@ def _validate_autowiring(container, classes, skipped=()):
             if not regs:
                 issues.append(f"{label}: no matching registration")
                 continue
-            best = max(_registration_score(reg, cls.__module__) for reg in regs)
-            tied = [reg for reg in regs if _registration_score(reg, cls.__module__) == best]
+            tied = _tied_candidates(regs, cls.__module__)
             if len(tied) > 1:
-                names = ", ".join(
-                    f"{(reg.implementation_type or reg.service_type).__module__}."
-                    f"{(reg.implementation_type or reg.service_type).__qualname__}"
-                    for reg in tied
-                )
+                names = ", ".join(_registration_label(reg) for reg in tied)
                 issues.append(f"{label}: ambiguous candidates: {names}")
             for reg in targets(tied, name):
                 for problem in construction_problems(reg, singleton_owner=singleton_owner):
                     issues.append(f"{label}: registered but unresolvable: {problem}")
+    issues.extend(untracked)
     if issues:
         raise AutowiringValidationError(issues, skipped)
     if skipped:

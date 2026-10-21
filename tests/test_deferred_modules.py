@@ -18,6 +18,7 @@ import logging
 import sys
 import textwrap
 import threading
+import time
 import uuid
 
 import pytest
@@ -50,7 +51,7 @@ def make_project(tmp_path, monkeypatch):
     """Build a project whose app module runs auto_inject while it is being imported."""
     tags = []
 
-    def build(main_body, *, validate=False, extra=None):
+    def build(main_body, *, validate=False, extra=None, app_tail=""):
         tag = uuid.uuid4().hex[:8]
         tags.append(tag)
         root = tmp_path / f"proj_{tag}"
@@ -81,8 +82,9 @@ def make_project(tmp_path, monkeypatch):
             container.register_singleton(Clock)
             container.register_singleton(Broken)
             autowired.auto_inject(container, root_dir=str(Path(__file__).resolve().parent), validate={validate})
+            APP_TAIL
             app = "ready"
-        """))
+        """).replace("APP_TAIL", app_tail.replace("TAG", tag)))
         (root / f"main_{tag}.py").write_text(f"from app_{tag} import app\n" + textwrap.dedent(main_body).replace("TAG", tag))
         for name, body in (extra or {}).items():
             path = root / name.replace("TAG", tag)
@@ -97,15 +99,25 @@ def make_project(tmp_path, monkeypatch):
     for name in set(sys.modules) - before:
         if any(tag in name for tag in tags):
             sys.modules.pop(name, None)
-    deferred = getattr(autowired, "_DEFERRED", {})
-    for name in list(deferred):
-        if any(tag in name for tag in tags):
-            deferred.pop(name, None)
+    for state in ("_DEFERRED", "_AWAITING"):
+        pending = getattr(autowired, state, {})
+        for name in list(pending):
+            if any(tag in name for tag in tags):
+                pending.pop(name, None)
 
 
 def _records(caplog, level, *parts):
     return [r.getMessage() for r in caplog.records
             if r.levelno == level and all(part in r.getMessage() for part in parts)]
+
+
+def _call(function, *args):
+    """Call; return the error instead of raising it."""
+    try:
+        function(*args)
+    except Exception as error:   # noqa: BLE001 - the test inspects it
+        return error
+    return None
 
 
 def _import(name):
@@ -472,8 +484,12 @@ def test_with_validate_every_later_import_of_the_broken_file_fails_too(make_proj
     assert module is None and isinstance(error, AutowiringValidationError)
 
 
-def _import_while_the_lock_is_busy(name):
-    """The import hook cannot take the lock: the module is queued and its import succeeds."""
+def _import_while_the_lock_is_busy(name, wait_for_drain=True):
+    """The import hook cannot take the lock: the module is queued and its import succeeds.
+
+    A background thread then patches and checks it as soon as the lock is free;
+    by default this helper returns only after that has happened.
+    """
     held, release = threading.Event(), threading.Event()
 
     def hold():
@@ -489,15 +505,21 @@ def _import_while_the_lock_is_busy(name):
     finally:
         release.set()
         holder.join(5)
+        if wait_for_drain:
+            deadline = time.monotonic() + 5
+            while autowired._PENDING_LATE_MODULES and time.monotonic() < deadline:
+                time.sleep(0.01)
+            with autowired._GLOBAL_LOCK:                     # the drain has finished its work
+                pass
 
 
 def test_a_queued_failure_with_validate_is_raised_by_the_next_auto_inject(make_project, caplog):
     root, tag = make_project(MISSING, validate=True)
     app = importlib.import_module(f"app_{tag}")
-    module, error = _import_while_the_lock_is_busy(f"main_{tag}")
-    assert error is None and module is not None             # the import finished; nobody to raise to
     with caplog.at_level(logging.DEBUG, logger="py_autowired"):
-        autowired.refresh()                                  # drains the queue: the check runs here
+        module, error = _import_while_the_lock_is_busy(f"main_{tag}")
+    assert error is None and module is not None             # the import finished; nobody to raise to
+    # The background drain checked it at once: ERROR now, the raise is kept for the next call.
     assert len(_records(caplog, logging.ERROR, f"main_{tag}", "no matching registration")) == 1
     try:
         autowired.auto_inject(app.container, root_dir=str(root))
@@ -512,7 +534,7 @@ def test_control_a_queued_failure_is_in_the_next_validate_autowiring(make_projec
     _root, tag = make_project(MISSING, validate=True)
     app = importlib.import_module(f"app_{tag}")
     _import_while_the_lock_is_busy(f"main_{tag}")
-    autowired.refresh()
+    _call(autowired.refresh)
     try:
         autowired.validate_autowiring(app.container)
         later = None
@@ -520,3 +542,262 @@ def test_control_a_queued_failure_is_in_the_next_validate_autowiring(make_projec
         later = caught
     assert later is not None
     assert f"main_{tag}.Consumer.missing_thing_instance: no matching registration" in later.issues
+
+
+# ---- refresh() / activate_container() finish their work, then raise ------------------------
+
+def test_refresh_raises_a_queued_validate_failure_after_refreshing(make_project):
+    _root, tag = make_project(MISSING, validate=True)
+    app = importlib.import_module(f"app_{tag}")
+    _import_while_the_lock_is_busy(f"main_{tag}")
+    generation = autowired._NAME_MAP_CACHE._generation
+    error = _call(autowired.refresh)
+    assert isinstance(error, AutowiringValidationError)
+    assert f"main_{tag}.Consumer.missing_thing_instance: no matching registration" in error.issues
+    assert autowired._NAME_MAP_CACHE._generation == generation + 1     # its own work was done
+    assert autowired._NAME_MAP_CACHE._container is app.container
+
+
+def test_activate_container_raises_a_queued_validate_failure_after_activating(make_project):
+    from py_autowired import Container
+    _root, tag = make_project(MISSING, validate=True)
+    app = importlib.import_module(f"app_{tag}")
+    _import_while_the_lock_is_busy(f"main_{tag}")
+    other = Container()
+    error = _call(autowired.activate_container, other)
+    assert isinstance(error, AutowiringValidationError)
+    assert autowired._NAME_MAP_CACHE._container is other              # its own work was done
+    assert _call(autowired.activate_container, app.container) is None   # reported once, not on every call
+    assert autowired._NAME_MAP_CACHE._container is app.container
+
+
+def test_auto_inject_raises_a_failure_it_drains_after_finishing(make_project, monkeypatch, tmp_path):
+    """The queue is drained once more after auto_inject() has done its work."""
+    from py_autowired import Container
+    _root, tag = make_project(MISSING, validate=True)
+    importlib.import_module(f"app_{tag}")
+    monkeypatch.setattr(autowired, "_drain_when_free", lambda: None, raising=False)   # keep it queued
+    _import_while_the_lock_is_busy(f"main_{tag}", wait_for_drain=False)
+    monkeypatch.setattr(autowired, "_check_loaded_deferred", lambda *a, **k: None, raising=False)
+    empty = tmp_path / f"empty_{tag}"
+    empty.mkdir()
+    container = Container()
+    error = _call(autowired.auto_inject, container, str(empty))
+    assert isinstance(error, AutowiringValidationError)
+    assert autowired._NAME_MAP_CACHE._container is container          # the call itself completed
+
+
+def test_control_refresh_without_validate_only_logs(make_project, caplog):
+    _root, tag = make_project(MISSING)
+    importlib.import_module(f"app_{tag}")
+    _import_while_the_lock_is_busy(f"main_{tag}")
+    with caplog.at_level(logging.DEBUG, logger="py_autowired"):
+        assert _call(autowired.refresh) is None
+    assert len(_records(caplog, logging.ERROR, f"main_{tag}")) == 1
+
+
+# ---- a skipped file nobody imports is loaded and checked at the first safe moment ------------
+
+def _first_injection(tag):
+    """Any object with an injected field: the first injection after startup."""
+    return sys.modules[f"other_{tag}"].Other()
+
+
+OTHER = {"other_TAG.py": GOOD.replace("Consumer", "Other")}
+
+
+@pytest.mark.parametrize("body, problem", [
+    (MISSING, "Consumer.missing_thing_instance: no matching registration"),
+    (UNRESOLVABLE, "Consumer.broken_instance: registered but unresolvable"),
+], ids=["no_registration", "unresolvable"])
+def test_a_never_imported_skipped_file_is_checked_at_the_first_injection(make_project, caplog, body, problem):
+    _root, tag = make_project(body, extra=OTHER)
+    importlib.import_module(f"app_{tag}")
+    assert f"main_{tag}" not in sys.modules                 # nobody imports it
+    with caplog.at_level(logging.DEBUG, logger="py_autowired"):
+        _first_injection(tag)
+    assert f"main_{tag}" in sys.modules
+    assert len(_records(caplog, logging.ERROR, f"main_{tag}", problem)) == 1
+
+
+def test_with_validate_the_first_injection_raises_for_a_never_imported_file(make_project):
+    _root, tag = make_project(MISSING, validate=True, extra=OTHER)
+    importlib.import_module(f"app_{tag}")
+    error = _call(_first_injection, tag)
+    assert isinstance(error, AutowiringValidationError)
+    assert error.issues == (f"main_{tag}.Consumer.missing_thing_instance: no matching registration",)
+
+
+def test_a_never_imported_healthy_file_is_loaded_checked_and_filled(make_project, caplog):
+    _root, tag = make_project(GOOD, extra=OTHER)
+    importlib.import_module(f"app_{tag}")
+    with caplog.at_level(logging.DEBUG, logger="py_autowired"):
+        _first_injection(tag)
+        _first_injection(tag)                               # loaded once, not again
+    assert len(_records(caplog, logging.INFO, "Checked", f"main_{tag}")) == 1
+    assert sys.modules[f"main_{tag}"].Consumer().clock_instance.now() == "tick"
+    assert getattr(autowired, "_AWAITING", None) is not None and f"main_{tag}" not in autowired._AWAITING
+
+
+def test_validate_autowiring_loads_a_never_imported_skipped_file(make_project):
+    _root, tag = make_project(MISSING)
+    app = importlib.import_module(f"app_{tag}")
+    error = _call(autowired.validate_autowiring, app.container)
+    assert isinstance(error, AutowiringValidationError)
+    assert f"main_{tag}.Consumer.missing_thing_instance: no matching registration" in error.issues
+    assert "Not checked yet" not in str(error)
+
+
+@pytest.mark.parametrize("call", ["refresh", "activate"])
+def test_refresh_and_activate_load_a_never_imported_skipped_file(make_project, caplog, call):
+    _root, tag = make_project(MISSING)
+    app = importlib.import_module(f"app_{tag}")
+    with caplog.at_level(logging.DEBUG, logger="py_autowired"):
+        if call == "refresh":
+            autowired.refresh()
+        else:
+            autowired.activate_container(app.container)
+    assert len(_records(caplog, logging.ERROR, f"main_{tag}", "no matching registration")) == 1
+
+
+def test_a_skipped_file_is_not_loaded_while_its_blocker_is_still_loading(make_project, caplog):
+    """An injection inside the app module, after auto_inject(): main must wait (it would fail again)."""
+    _root, tag = make_project(GOOD, extra=OTHER, app_tail="from other_TAG import Other\nOther()")
+    with caplog.at_level(logging.DEBUG, logger="py_autowired"):
+        importlib.import_module(f"app_{tag}")
+    assert f"main_{tag}" not in sys.modules
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+    _first_injection(tag)                                   # the app finished: now it loads
+    assert f"main_{tag}" in sys.modules
+
+
+def test_a_real_import_failure_found_later_is_a_warning_once(make_project, caplog):
+    _root, tag = make_project("import does_not_exist_pkg_0541\n" + GOOD, extra=OTHER)
+    importlib.import_module(f"app_{tag}")
+    with caplog.at_level(logging.DEBUG, logger="py_autowired"):
+        _first_injection(tag)
+        _first_injection(tag)
+    assert len(_records(caplog, logging.WARNING, f"Import failed for main_{tag}", "does_not_exist_pkg_0541")) == 1
+
+
+# ---- check_skipped(): explicit check for tests --------------------------------------------
+
+def test_check_skipped_raises_for_any_problem_even_without_validate(make_project):
+    _root, tag = make_project(MISSING)
+    app = importlib.import_module(f"app_{tag}")
+    check = getattr(py_autowired, "check_skipped", None)
+    assert callable(check) and "check_skipped" in py_autowired.__all__
+    importlib.import_module(f"main_{tag}")                  # already checked once (ERROR logged)
+    error = _call(check, app.container)
+    assert isinstance(error, AutowiringValidationError)
+    assert error.issues == (f"main_{tag}.Consumer.missing_thing_instance: no matching registration",)
+
+
+def test_check_skipped_returns_the_checked_names_when_healthy(make_project):
+    _root, tag = make_project(GOOD)
+    importlib.import_module(f"app_{tag}")
+    check = getattr(py_autowired, "check_skipped", lambda *a: None)
+    assert check() == (f"main_{tag}",)                      # default: the active container
+    assert f"main_{tag}" in sys.modules
+
+
+def test_check_skipped_reports_a_file_that_cannot_be_imported(make_project):
+    _root, tag = make_project("import does_not_exist_pkg_0542\n" + GOOD)
+    app = importlib.import_module(f"app_{tag}")
+    check = getattr(py_autowired, "check_skipped", lambda *a: None)
+    error = _call(check, app.container)
+    assert isinstance(error, AutowiringValidationError)
+    assert len(error.issues) == 1 and error.issues[0].startswith(f"main_{tag}: could not be imported: ")
+    assert "does_not_exist_pkg_0542" in error.issues[0]
+
+
+def test_check_skipped_reports_a_file_that_is_still_loading(make_project, monkeypatch):
+    _root, tag = make_project(GOOD)
+    app = importlib.import_module(f"app_{tag}")
+    loading = type(sys)(f"main_{tag}")
+    loading.__spec__ = importlib.machinery.ModuleSpec(f"main_{tag}", None)
+    loading.__spec__._initializing = True
+    monkeypatch.setitem(sys.modules, f"main_{tag}", loading)
+    check = getattr(py_autowired, "check_skipped", lambda *a: None)
+    error = _call(check, app.container)
+    assert isinstance(error, AutowiringValidationError)
+    assert error.issues == (f"main_{tag}: is still being imported; call check_skipped() after startup",)
+
+
+def test_check_skipped_without_any_container_says_so(monkeypatch):
+    monkeypatch.setattr(autowired, "_NAME_MAP_CACHE", None)
+    check = getattr(py_autowired, "check_skipped", lambda *a: None)
+    error = _call(check)
+    assert isinstance(error, py_autowired.DependencyInjectionError)
+    assert "auto_inject" in str(error)
+
+
+# ---- branch guards for the load-time machinery ---------------------------------------------
+
+@pytest.mark.parametrize("call", ["refresh", "activate"])
+def test_refresh_and_activate_raise_what_their_own_drain_found(make_project, monkeypatch, call):
+    _root, tag = make_project(MISSING, validate=True)
+    app = importlib.import_module(f"app_{tag}")
+    monkeypatch.setattr(autowired, "_drain_when_free", lambda: None, raising=False)   # stays queued
+    _import_while_the_lock_is_busy(f"main_{tag}", wait_for_drain=False)
+    monkeypatch.setattr(autowired, "_load_skipped", lambda *a, **k: None, raising=False)
+    if call == "refresh":
+        error = _call(autowired.refresh)
+    else:
+        error = _call(autowired.activate_container, app.container)
+    assert isinstance(error, AutowiringValidationError)
+
+
+def test_check_skipped_reports_a_file_whose_import_fails_validation(make_project):
+    _root, tag = make_project(MISSING, validate=True)
+    app = importlib.import_module(f"app_{tag}")
+    check = getattr(py_autowired, "check_skipped", lambda *a: None)
+    error = _call(check, app.container)                     # never imported before: the import fails
+    assert isinstance(error, AutowiringValidationError)
+    assert f"main_{tag}.Consumer.missing_thing_instance: no matching registration" in error.issues
+
+
+def test_check_skipped_patches_and_checks_a_file_loaded_around_the_hook(make_project, monkeypatch):
+    _root, tag = make_project(MISSING)
+    app = importlib.import_module(f"app_{tag}")
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "meta_path", [f for f in sys.meta_path
+                                         if not isinstance(f, autowired._LateImportFinder)])
+        importlib.import_module(f"main_{tag}")
+    check = getattr(py_autowired, "check_skipped", lambda *a: None)
+    error = _call(check, app.container)
+    assert isinstance(error, AutowiringValidationError)
+    assert error.issues == (f"main_{tag}.Consumer.missing_thing_instance: no matching registration",)
+    assert f"main_{tag}" not in getattr(autowired, "_DEFERRED", {})
+
+
+def test_check_skipped_reports_a_file_it_cannot_check(make_project, monkeypatch):
+    _root, tag = make_project(GOOD)
+    app = importlib.import_module(f"app_{tag}")
+    importlib.import_module(f"main_{tag}")
+
+    def broken(*_args):
+        raise RuntimeError("cannot patch")
+
+    monkeypatch.setattr(autowired, "_patch_module_classes", broken)
+    check = getattr(py_autowired, "check_skipped", lambda *a: None)
+    error = _call(check, app.container)
+    assert isinstance(error, AutowiringValidationError)
+    assert error.issues == (f"main_{tag}: could not be checked: RuntimeError('cannot patch')",)
+
+
+def test_validate_autowiring_checks_a_loaded_skipped_file_the_automatic_path_missed(make_project, monkeypatch):
+    """The automatic load ran while no container was active and could not check; validation still does."""
+    _root, tag = make_project(MISSING)
+    app = importlib.import_module(f"app_{tag}")
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "meta_path", [f for f in sys.meta_path
+                                         if not isinstance(f, autowired._LateImportFinder)])
+        importlib.import_module(f"main_{tag}")              # loaded around the hook: not checked
+    cache = autowired._NAME_MAP_CACHE
+    monkeypatch.setattr(autowired, "_NAME_MAP_CACHE", None)
+    autowired._load_skipped()                               # takes it off the waiting list, cannot check
+    monkeypatch.setattr(autowired, "_NAME_MAP_CACHE", cache)
+    error = _call(autowired.validate_autowiring, app.container)
+    assert isinstance(error, AutowiringValidationError)
+    assert f"main_{tag}.Consumer.missing_thing_instance: no matching registration" in error.issues

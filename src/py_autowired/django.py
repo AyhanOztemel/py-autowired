@@ -47,5 +47,5 @@ def attach_container(
     else:
         wrapped = WsgiRequestScope(application, container, startup)
     if close_on_shutdown:
-        atexit.register(container._release_singletons)
+        atexit.register(container._release_singletons_at_exit)
     return wrapped

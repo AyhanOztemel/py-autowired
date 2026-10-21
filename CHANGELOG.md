@@ -2,35 +2,109 @@
 
 ## 0.5.4 - 2026-10-21
 
-A file that discovery cannot load yet (it imports the application module while
-that module is still starting, typically `main.py` doing `from app import app`)
-is no longer only a DEBUG line. Nothing is removed; nothing about it is hidden.
+Nothing hides any more: no problem stays behind a `try/except`, a DEBUG-only
+line or a quiet default. Nothing is removed; what gets injected does not change.
 
 ### Added
 
-- `skipped_during_discovery()`: the module names the latest discovery skipped
-  this way, so applications and tests can load and check them.
-- Such a file is checked the moment it loads, with the same static check as
-  `validate=True` (no service is constructed): a wiring problem is logged as
-  ERROR at once instead of appearing when a field is first used. If the
-  `auto_inject()` call that skipped it had `validate=True`, the import of the
-  file fails with `AutowiringValidationError` (and fails again if retried). If
-  the file finished loading in another thread while the library lock was busy,
-  that import cannot be failed any more: the problem is logged as ERROR at once
-  and the next `auto_inject()` or `validate_autowiring()` raises it. A
-  healthy file logs INFO `Checked ... no wiring problems`. The check runs on
-  every route the file can load by: the import hook, another thread (when the
-  lock is free again), a later `auto_inject()`, or `validate_autowiring()`.
-- `validate=True` / `validate_autowiring()`: skipped files that have not loaded
-  yet are named on a line of their own (in the error message, or as an INFO
-  line when validation passes). A skipped file that is never imported is never
-  checked; import the names from `skipped_during_discovery()` in a test.
+- A file that discovery cannot load yet (it imports the application module
+  while that module is still starting, typically `main.py` doing
+  `from app import app`) is checked the moment it loads, with the static check
+  of `validate=True` (no service is constructed): a wiring problem is an ERROR
+  at once instead of appearing when a field is first used; with `validate=True`
+  the import of the file fails with `AutowiringValidationError` (again if
+  retried). A healthy file logs INFO `Checked ... no wiring problems`.
+- If the application never imports such a file, the library imports and checks
+  it at the first safe moment: the first injection after the application module
+  has finished loading, or `refresh()`, `activate_container()`,
+  `validate_autowiring()`. (Discovery imports every project file anyway.)
+- `skipped_during_discovery()`: the module names the latest discovery skipped.
+- `check_skipped(container=None)`: imports and checks every skipped module and
+  raises `AutowiringValidationError` for any problem, whatever `validate` was -
+  for tests and startup checks.
+- `validate=True` / `validate_autowiring()` name skipped files that have not
+  loaded yet on a line of their own.
+- New WARNINGs where a problem used to be silent or DEBUG-only: a field with no
+  matching registration (once per field), a contract without an implementation
+  after discovery, fields whose best candidates tie (ONE grouped WARNING at
+  startup; the first registered one is used, as before), constructor type hints
+  that cannot be resolved (once per class), a project module imported by a
+  loader the import hook cannot patch, a file discovery could not process, a
+  module whose path cannot be read, `auto_inject()` that found nothing to load
+  or patch, and a class that could not be tracked for validation (also a
+  validation issue).
+
+- An independent blind review found more silent paths; each is now visible or
+  fixed (each pinned by a test that failed before the change):
+  - validation reports a singleton holding `Lazy[Scoped]` (Lazy keeps the first
+    value), a keyed singleton capturing a scoped field, a positional-only
+    constructor parameter (the container passes arguments by name), and every
+    project module discovery could not import or a late import could not patch;
+  - a scoped service resolved while a singleton is being created is a WARNING
+    (once per pair; behaviour unchanged). All warnings raised during resolution
+    are written after every creation lock is released - a log handler may take
+    locks of its own;
+  - a late-imported module that cannot be patched is an ERROR (was WARNING);
+  - a thread waiting at a creation gate longer than
+    `container.creation_wait_warning` seconds (10 by default) logs one WARNING:
+    a factory waiting (e.g. `thread.join()`) for a worker that needs the very
+    service being created cannot be detected as a deadlock, but no longer hangs
+    silently.
 
 ### Changed
 
-- The skip itself is logged at INFO (was DEBUG): `Skipped X during discovery:
-  it imports Y, which is still being imported; it is checked when it loads`.
-  Real import failures are still WARNINGs.
+- The skip itself is logged at INFO (was DEBUG). Real import failures are
+  still WARNINGs.
+- `refresh()`, `activate_container()` and `auto_inject()` raise a
+  `validate=True` failure of a file that finished loading in another thread
+  while the library was busy - after finishing their own work.
+- Validation no longer passes what the container would fail on: an unreadable
+  constructor signature and a type hint that cannot be resolved (without a
+  default) are now issues. A non-callable `__init__` fails as Python makes it
+  fail (the patched constructor used to swallow it).
+
+### Fixed
+
+- Two registrations of the same ready object (`register_instance(A, obj)` and
+  `register_instance(B, obj)`) were reported as "equally good candidates"
+  (startup WARNING and `validate=True`): every candidate gives the field that
+  same object, so it is no ambiguity. Two separate singletons of one class still
+  are.
+- A method or a read-only property whose name ends in `_instance` (for example
+  a `has_instance` property) was taken for an injection field: injection could
+  never fill it, validation reported it. Fields are names that can receive a
+  value (class attribute, annotation, assignment, slot/attrs/dataclass field,
+  property with a setter). Two tests that used a read-only property as a field
+  now use a settable one; their intent (a failing getter only warns; validation
+  never runs a property) is unchanged.
+- A plural field declared in the class body (`repo_instances = None`) received
+  one object instead of the list.
+- `Lazy.value` read again while it is being resolved hung on its own lock; it
+  now raises `CircularDependencyError` (and never builds a second object).
+- A scoped factory waiting for a worker thread that needs another scoped
+  service of the same scope hung: the scope held one lock for every creation.
+  Each scoped slot now has its own creation gate, with the cross-thread cycle
+  check of singletons; closing a scope from inside one of its creations raises
+  instead of hanging.
+- `strict_registrations=True` now also rejects a second keyed or open-generic
+  registration of the same key/type.
+- The Flask/Django bridges close an `aclose()`-only singleton at process exit
+  instead of failing with `AsyncDisposalRequiredError`; a cancelled Django ASGI
+  request still closes its scoped services.
+- A finalizer attribute that is not callable (`dispose = True`) no longer hides
+  the real `close()`; a failing log handler no longer loses the notes of further
+  disposal errors.
+- Deadlock risk: the finalizer of a garbage-collected container waited for the
+  library lock. The garbage collector can run it in any thread, also one that
+  the lock holder is waiting for. It never waits now: when the lock is busy the
+  next lock holder finishes the job. Because it can now run late, it drops only
+  its own container's entries - `id()` values are reused, and a late drop must
+  never remove a newer container's (a requirement of the new design, not a 0.5.3
+  bug).
+- A late import queued while the lock was busy was patched only at the next
+  drain of the queue (a later import, `refresh()`, `activate_container()` or
+  `auto_inject()`) - which might never come. It is now patched as soon as the
+  lock is free.
 
 ## 0.5.3 - 2026-10-21
 

@@ -246,8 +246,14 @@ def test_factory_hides_constructor_and_abstract_details_from_validation(graph):
     assert calls == [container]
 
 
-@pytest.mark.parametrize("kind", ["forward_reference", "opaque", "positional_only"])
-def test_uncertain_constructor_details_are_not_validation_errors(graph, kind):
+@pytest.mark.parametrize("kind, issue", [
+    # 0.5.4: the container fails on these at resolve(); validation no longer passes them.
+    ("forward_reference", "Unknown.dependency: type hint cannot be resolved"),
+    ("opaque", "Unknown: constructor signature cannot be read"),
+    # 0.5.4: the container passes arguments by name, so this fails at resolve() too.
+    ("positional_only", "Unknown.dependency is positional-only"),
+])
+def test_uncertain_constructor_details_are_reported_like_runtime(graph, kind, issue):
     container, patch = graph
 
     class Service:
@@ -272,7 +278,14 @@ def test_uncertain_constructor_details_are_not_validation_errors(graph, kind):
     container.register_transient(Service)
     container.register_transient(Unknown)
     patch(Consumer)
-    assert validate_autowiring(container) is None
+    if issue is None:
+        assert validate_autowiring(container) is None
+        return
+    with pytest.raises(Exception):                       # what resolve() does with it
+        container.resolve(Unknown)
+    with pytest.raises(AutowiringValidationError) as caught:
+        validate_autowiring(container)
+    assert any(issue in item for item in caught.value.issues)
 
 
 def test_registered_default_dependency_is_still_checked_like_runtime(graph):
@@ -370,6 +383,10 @@ def test_manual_class_value_and_property_are_not_executed(graph):
         @property
         def unknown_instance(self):
             pytest.fail("descriptor must not run")
+
+        @unknown_instance.setter          # 0.5.4: settable, so it is a field
+        def unknown_instance(self, value):
+            pass
 
     patch(Consumer)
     with pytest.raises(AutowiringValidationError) as error:

@@ -92,7 +92,7 @@ def test_flask_bridge_one_call(tmp_path, monkeypatch, project_env):
     assert len(closed) == 1                         # request scope ended with the response
     _call(app_mod.app.wsgi_app, "/products")
     assert len(closed) == 2 and closed[0] is not closed[1]
-    assert project_env == [app_mod.container._release_singletons]
+    assert project_env == [app_mod.container._release_singletons_at_exit]
 
 
 def test_flask_bridge_rejects_a_second_container(tmp_path, project_env):
@@ -155,7 +155,7 @@ def test_django_bridge_one_call(tmp_path, monkeypatch, project_env):
     status, body = _call(application, "/products")
     assert status.startswith("200") and body == b'["Notebook", "Pencil"]'
     assert len(closed) == 1
-    assert project_env == [register.container._release_singletons]
+    assert project_env == [register.container._release_singletons_at_exit]
 
 
 def test_django_bridge_wraps_an_asgi_application(tmp_path, project_env):
@@ -188,4 +188,4 @@ def test_django_bridge_wraps_an_asgi_application(tmp_path, project_env):
     (a1, a2), (b1, b2) = seen
     assert a1 is a2 and b1 is b2 and a1 is not b1   # one Session per request
     assert Session.closed == [a1, b1]               # closed when each request ended
-    assert project_env == [container._release_singletons]
+    assert project_env == [container._release_singletons_at_exit]

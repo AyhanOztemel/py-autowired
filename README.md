@@ -213,8 +213,10 @@ auto_inject(container, validate=True)             # console
 ```
 
 It lists fields with no matching registration, equally good candidates,
-constructor dependencies that cannot be resolved, dependency cycles, and a
-singleton that would capture a scoped service. It only reads; it constructs no
+constructor dependencies that cannot be resolved (also an unreadable signature,
+a type hint that cannot be resolved, or a positional-only parameter), dependency
+cycles, a singleton that would capture a scoped service (also through `Lazy`),
+and project modules discovery could not import or patch. It only reads; it constructs no
 services. To check again later: `validate_autowiring(container)`
 (raises `AutowiringValidationError` with `.issues`). A file that could not be
 loaded during discovery is named on a line of its own and checked when it loads
@@ -237,7 +239,10 @@ class ReportService:
 ```
 
 A singleton may safely hold `Provider[ScopedService]`: every call resolves from
-the scope active at that moment.
+the scope active at that moment. It must not hold `Lazy[ScopedService]`: a
+`Lazy` keeps the first value, so the singleton would keep the first request's
+object (`validate=True` reports it). Reading a `Lazy` again while it is being
+created raises `CircularDependencyError` instead of hanging.
 
 ### Several implementations of one contract
 
@@ -282,7 +287,8 @@ class ReportService:
   with `AmbiguousImplementationError` when two implementations exist:
   py_autowired does not guess which one you mean.
 - `Container(strict_registrations=True)` forbids registering a contract twice,
-  so this feature is not available there.
+  so this feature is not available there (keyed and open-generic registrations
+  included).
 
 ### Choosing between several implementations: `set_primary`
 
@@ -357,9 +363,26 @@ from `py_autowired.fastapi`. The fields of the object are filled the same way.
 
 ### Logging and debug output
 
-The library logs to `logging.getLogger("py_autowired")` and is silent by
-default. Discovery problems are logged as WARNING. Set `PY_AUTOWIRED_DEBUG=1`
-before import for detailed DEBUG output.
+The library logs to `logging.getLogger("py_autowired")` and writes nothing
+while everything is fine. Anything that could hide a problem is a WARNING (or
+an ERROR), never a DEBUG-only line:
+
+- a project file that cannot be imported or discovered;
+- a field with no matching registration (once per field; it stays `None`);
+- a contract registered without an implementation that discovery did not find;
+- fields whose best candidates tie: ONE grouped WARNING at startup; the first
+  registered candidate is used (`validate=True` reports them as errors). Two
+  registrations of the same ready object are not a tie; what a factory returns
+  cannot be known in advance, so two factories returning one object still are;
+- constructor type hints that cannot be resolved (a parameter with a default
+  keeps its default);
+- a scoped service resolved while a singleton is being created (if the
+  singleton keeps it, it outlives its scope) - once per pair;
+- a project module imported by a loader the import hook cannot patch (outside
+  excluded folders such as `tests`);
+- `auto_inject()` that found nothing to load and nothing to patch (check `root_dir`).
+
+Set `PY_AUTOWIRED_DEBUG=1` before import for detailed DEBUG output.
 
 ### Files loaded after startup
 
@@ -369,43 +392,63 @@ loaded during discovery. It is not lost, and nothing about it is hidden:
 
 - startup logs it at INFO: `Skipped main during discovery: ... it is checked when it loads`;
 - the moment it loads, its `*_instance` fields are filled **and checked** the
-  way `validate=True` checks them. A problem is logged as ERROR at once (with
-  `validate=True` the import of that file fails with `AutowiringValidationError`),
-  so it never waits until the field is used. A healthy file logs INFO
-  `Checked main after it loaded ...`;
-- `skipped_during_discovery()` returns the names, so a test can load them:
+  way `validate=True` checks them. A problem is an ERROR at once; with
+  `validate=True` the import of that file fails with `AutowiringValidationError`.
+  A healthy file logs INFO `Checked main after it loaded ...`;
+- if the application never imports it (a server started from the application
+  module itself), the library imports it at the first safe moment: the first
+  field injection after the application module has finished loading, or
+  `refresh()`, `activate_container()`, `validate_autowiring()`. Discovery
+  imports every project file anyway; this is the same import, done later;
+- `skipped_during_discovery()` returns the names, and `check_skipped()` imports
+  and checks all of them, raising `AutowiringValidationError` for any problem
+  whatever `validate` was:
 
 ```python
-import importlib
-from py_autowired import skipped_during_discovery
+from py_autowired import check_skipped
 
-def test_files_skipped_at_startup_load_and_are_wired():
-    import app                                   # the application starts
-    for name in skipped_during_discovery():
-        importlib.import_module(name)            # checked now (validate=True: raises on a problem)
+def test_files_skipped_at_startup_are_wired():
+    import app            # the application starts
+    check_skipped()       # raises on any problem
 ```
 
-`validate_autowiring(container)` also checks a skipped file that has loaded
-since, and names the ones that have not loaded yet on a line of their own.
-
-A skipped file that is **never imported** is never checked: it stays an INFO
-line and a name in `skipped_during_discovery()`. If your server starts from the
-application module itself, import the skipped files in a test as above. If a
-file finishes loading in another thread while the library is busy, its import
-cannot be failed any more: the problem is logged as ERROR at once and, with
-`validate=True`, the next `auto_inject()` or `validate_autowiring()` raises it.
+If such a file finishes loading in another thread while the library is busy,
+its import cannot be failed any more: the problem is an ERROR at once and, with
+`validate=True`, the next library call (`refresh()`, `activate_container()`,
+`auto_inject()`, `validate_autowiring()` or the next injection) raises it after
+doing its own work. A skipped file that has not loaded yet is named on a line
+of its own by `validate_autowiring()`.
 
 ## Notes
 
 - **Concurrency:** ready singletons and cached lookups are lock-free. A
   dependency cycle raises `CircularDependencyError` instead of freezing, even
-  when two threads hit it at the same time. The suite runs on the free-threaded
+  when two threads hit it at the same time. Each scoped service is created
+  under its own gate, so a factory may wait for a worker thread that needs
+  another scoped service of the same scope. Known limit: a factory that waits
+  (for example with `thread.join()`) for a worker needing the very service the
+  factory is creating waits forever - no lock shows that wait, for singletons
+  as for scoped services. It is not silent: a thread that waits at a creation
+  gate longer than `container.creation_wait_warning` seconds (10 by default)
+  logs one WARNING naming both threads - at once if it holds no creation lock
+  itself, otherwise when it releases them. The suite runs on the free-threaded
   CPython 3.14t build.
+- **Shutdown of the Flask/Django bridges:** container-created singletons are
+  closed at process exit; one that only has `aclose()` is closed in a short
+  event loop.
 - **One container per process:** class patches are process-wide; run separate
   applications in separate processes.
 - **Discovery imports modules** under the project folder. Use `exclude_dirs` for
   folders that must not be imported. `tests` and `examples` folders inside the
-  project are skipped automatically.
+  project are skipped automatically (as are `venv`, `.venv`, `site-packages`,
+  `build`, `dist`). A vendored copy of a library, or a second installation, kept
+  inside the project must be excluded by name:
+  `auto_inject(container, exclude_dirs=["vendor", "third_party"])`.
+- **What counts as a field:** a name ending in `_instance`/`_instances` that can
+  receive a value - a class attribute, an annotation, a `self.x_instance = ...`
+  assignment, a `__slots__`/attrs/dataclass field or a property with a setter.
+  A method or a read-only property with such a name (`has_instance`) is not a
+  field.
 - **`resolve()` is synchronous:** a factory that returns a bare coroutine raises
   `AsyncFactoryError`.
 - **Compatibility:** ordinary classes, `__slots__`, mutable dataclasses and

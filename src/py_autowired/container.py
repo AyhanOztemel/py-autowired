@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 from dataclasses import dataclass, field
 from enum import Enum
@@ -10,6 +11,7 @@ import inspect
 import logging
 import re
 import threading
+import time
 from types import TracebackType
 from typing import Annotated, Any, Callable, Dict, Generic, Optional, Type, TypeVar, Union, get_args, get_origin, get_type_hints
 
@@ -17,6 +19,34 @@ from typing import Annotated, Any, Callable, Dict, Generic, Optional, Type, Type
 T = TypeVar("T")
 _UNSET = object()
 logger = logging.getLogger("py_autowired")
+_WARNED: set = set()  # keys of the once-only warnings already written
+# Resolution depth of this thread. A log handler may take its own locks (or
+# resolve services): warnings raised while resolving wait until the outermost
+# resolution has released every creation lock.
+_RESOLVING = threading.local()
+
+
+def _warn_once(key, message: str, *args: Any) -> None:
+    """A WARNING that repeats nothing: one line per problem, not per call."""
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    if getattr(_RESOLVING, "depth", 0):
+        _RESOLVING.__dict__.setdefault("pending", []).append((message, args))
+    else:
+        logger.warning(message, *args)
+
+
+def _flush_warnings() -> None:
+    pending = getattr(_RESOLVING, "pending", None)
+    while pending:
+        message, args = pending.pop(0)
+        logger.warning(message, *args)
+
+
+# The singleton being created in this context (innermost), for N6.
+_SINGLETON_IN_CREATION: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "py_autowired_singleton_in_creation", default=None)
 
 
 class LifetimeScope(Enum):
@@ -81,12 +111,15 @@ def _raise_disposal_errors(errors: list) -> None:
             except Exception:  # a broken __str__ must not mask the first error
                 text = "<unprintable>"
             note = f"Additional disposal error: {type(error).__name__}: {text}"
-            try:
-                logger.error(note, exc_info=(type(error), error, error.__traceback__))
+            try:  # the note first: a failing log handler must not lose it
                 if hasattr(first, "add_note"):
                     first.add_note(note)
                 else:  # Python 3.10 has no add_note(); same __notes__ contract.
                     first.__notes__ = [*getattr(first, "__notes__", ()), note]
+            except Exception:
+                pass
+            try:
+                logger.error(note, exc_info=(type(error), error, error.__traceback__))
             except Exception:
                 pass
     finally:
@@ -220,20 +253,31 @@ class Provider(Generic[T]):
 class Lazy(Generic[T]):
     """Resolve ``service_type`` once, on first ``.value`` access."""
 
-    __slots__ = ("_container", "_service_type", "_value", "_lock")
+    __slots__ = ("_container", "_service_type", "_value", "_lock", "_resolving")
 
     def __init__(self, container: "Container", service_type: Type[T]) -> None:
         self._container = container
         self._service_type = service_type
         self._value: Any = _UNSET
         self._lock = threading.Lock()  # per-Lazy; never on the container path
+        self._resolving: Optional[int] = None  # thread that is resolving the value now
 
     @property
     def value(self) -> T:
         if self._value is _UNSET:
+            if self._resolving == threading.get_ident():
+                # Read again by its own resolution: waiting on the lock would hang
+                # and resolving again would build a second object. Neither: say so.
+                raise CircularDependencyError(
+                    f"{self!r}.value was read again while it is being resolved"
+                )
             with self._lock:
                 if self._value is _UNSET:
-                    self._value = self._container.resolve(self._service_type)
+                    self._resolving = threading.get_ident()
+                    try:
+                        self._value = self._container.resolve(self._service_type)
+                    finally:
+                        self._resolving = None
         return self._value
 
     @property
@@ -344,11 +388,33 @@ def _unwrap_annotation(annotation: Any) -> Any:
     return annotation
 
 
+def _first_callable(instance: Any, *names: str) -> Optional[Callable[[], Any]]:
+    """The first finalizer that can be called: a flag named ``dispose`` must not
+    hide a real ``close()``."""
+    for name in names:
+        finalizer = getattr(instance, name, None)
+        if callable(finalizer):
+            return finalizer
+    return None
+
+
+class _CreationGate:
+    """One scoped slot being created in one scope (the wait-for graph key)."""
+
+    __slots__ = ("slot", "lock", "__weakref__")
+
+    def __init__(self, slot: Any) -> None:
+        self.slot = slot
+        self.lock = threading.RLock()
+
+
 class _ScopeState:
     def __init__(self) -> None:
         self.instances: Dict[Type[Any], Any] = {}
         self.creation_order: list[Type[Any]] = []
+        # Guards the dictionaries only; user code never runs under it.
         self.lock = threading.RLock()
+        self.gates: Dict[Any, _CreationGate] = {}  # slot -> gate of its creation in progress
         self.closed = False
 
     def get_or_create(self, registration: ServiceRegistration, container: "Container") -> Any:
@@ -360,16 +426,40 @@ class _ScopeState:
             if self.closed:
                 raise ScopeNotActiveError("The active dependency scope is already closed")
             instance = self.instances.get(slot, _UNSET)
+            if instance is not _UNSET:
+                return instance
+            gate = self.gates.get(slot)
+            if gate is None:
+                gate = self.gates[slot] = _CreationGate(slot)
+        # One gate per slot of THIS scope, taken like a singleton's creation lock:
+        # other slots (and other scopes) are not blocked, and a lock cycle across
+        # threads raises CircularDependencyError instead of hanging.
+        container._acquire_creation(gate)
+        try:
+            with self.lock:
+                if self.closed:
+                    raise ScopeNotActiveError("The active dependency scope is already closed")
+                instance = self.instances.get(slot, _UNSET)
             if instance is _UNSET:
                 instance = container._create_instance(registration)
-                self.instances[slot] = instance
-                self.creation_order.append(slot)
+                with self.lock:
+                    self.instances[slot] = instance
+                    self.creation_order.append(slot)
             return instance
+        finally:
+            with _WAIT_LOCK:
+                owner = _LOCK_OWNERS.get(id(gate))
+                outermost = owner is None or owner[1] <= 1
+            if outermost:
+                with self.lock:
+                    if self.gates.get(slot) is gate:
+                        del self.gates[slot]
+            container._release_creation(gate)
 
     @staticmethod
     def _sync_finalize(instance: Any) -> None:
-        finalizer = getattr(instance, "dispose", None) or getattr(instance, "close", None)
-        if not callable(finalizer):
+        finalizer = _first_callable(instance, "dispose", "close")
+        if finalizer is None:
             if callable(getattr(instance, "aclose", None)):
                 raise AsyncDisposalRequiredError(
                     f"{type(instance).__name__} requires 'async with container.create_scope()'"
@@ -386,25 +476,36 @@ class _ScopeState:
 
     @staticmethod
     async def _async_finalize(instance: Any) -> None:
-        finalizer = (
-            getattr(instance, "aclose", None)
-            or getattr(instance, "dispose", None)
-            or getattr(instance, "close", None)
-        )
-        if not callable(finalizer):
+        finalizer = _first_callable(instance, "aclose", "dispose", "close")
+        if finalizer is None:
             return
         result = finalizer()
         if inspect.isawaitable(result):
             await result
 
     def _begin_close(self) -> Optional[list]:
-        # Flag + snapshot under the scope lock: an in-flight creation (which holds
-        # this lock) finishes first and is included; later creations see closed.
+        # Flag under the scope lock; later creations see closed. An in-flight
+        # creation finishes first and is included: wait for each open gate.
         # No finalizer runs under the lock.
+        me = threading.get_ident()
         with self.lock:
             if self.closed:
                 return None
+            gates = list(self.gates.values())
+            for gate in gates:
+                owner = _LOCK_OWNERS.get(id(gate))
+                if owner is not None and owner[0] == me:
+                    # Waiting for our own creation would hang; closing under it
+                    # would store the new object in a closed scope, never closed.
+                    raise DependencyInjectionError(
+                        f"A scope cannot be closed while this thread is creating "
+                        f"{_slot_name(gate.slot)} in it"
+                    )
             self.closed = True
+        for gate in gates:
+            with gate.lock:
+                pass
+        with self.lock:
             return list(self.creation_order)
 
     def _end_close(self) -> None:
@@ -469,6 +570,8 @@ class Container:
         self.registrations: Dict[Type[Any], ServiceRegistration] = {}
         self.strict_interfaces = strict_interfaces
         self.strict_registrations = strict_registrations
+        # Seconds a thread may wait at a creation gate before a WARNING (once per wait).
+        self.creation_wait_warning: float = 10.0
         self._implementation_selectors: Dict[Type[Any], Callable[[], Type[Any]]] = {}
         self.registration_history: list[tuple[str, Type[Any]]] = []
         self._registration_lock = threading.RLock()
@@ -545,6 +648,10 @@ class Container:
         Closed generics are not part of name-based field injection.
         """
         with self._registration_lock:
+            if self.strict_registrations and service_type in self._open_generics:
+                raise DuplicateServiceRegistrationError(
+                    f"Open generic is already registered: {service_type.__name__}"
+                )
             self._open_generics[service_type] = (implementation_type or service_type, scope)
             # Re-registration must not leave closed types built from the old one.
             for closed in [c for c in self._closed_generics if get_origin(c) is service_type]:
@@ -872,6 +979,24 @@ class Container:
                 ordered.append(instance)
         return ordered
 
+    def _release_singletons_at_exit(self) -> None:
+        """Process-exit shutdown of the WSGI/ASGI bridges: like _release_singletons,
+        but a singleton that can only be closed asynchronously is closed in a
+        short event loop instead of failing with AsyncDisposalRequiredError."""
+        errors: list[BaseException] = []
+        for instance in self._detach_created_singletons():
+            try:
+                _ScopeState._sync_finalize(instance)
+            except AsyncDisposalRequiredError:
+                try:
+                    asyncio.run(_ScopeState._async_finalize(instance))
+                except BaseException as exc:
+                    errors.append(exc)
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            _raise_disposal_errors(errors)
+
     def _release_singletons(self) -> None:
         """Synchronous host shutdown (WSGI bridges); see _detach_created_singletons."""
         errors: list[BaseException] = []
@@ -963,6 +1088,10 @@ class Container:
         registration = self._registration(service_type, implementation_type, scope)
         registration.key = key
         with self._registration_lock:
+            if self.strict_registrations and (service_type, key) in self._keyed:
+                raise DuplicateServiceRegistrationError(
+                    f"Keyed service is already registered: {service_type.__name__} with key {key!r}"
+                )
             self._keyed[(service_type, key)] = registration
             self.registration_history.append(("keyed", service_type))
 
@@ -996,11 +1125,15 @@ class Container:
             return
         with _WAIT_LOCK:
             _WAITING[me] = registration
+        started, warned = time.monotonic(), False
         try:
             while True:
                 if registration.lock.acquire(timeout=0.05):
                     self._note_owner(registration, me)
                     return
+                if not warned and time.monotonic() - started >= self.creation_wait_warning:
+                    warned = True
+                    self._warn_long_wait(registration, me, time.monotonic() - started)
                 cycle = _thread_wait_cycle(me)
                 if cycle is not None:
                     names = " -> ".join(_slot_name(item.slot) for item in cycle)
@@ -1011,6 +1144,23 @@ class Container:
         finally:
             with _WAIT_LOCK:
                 _WAITING.pop(me, None)
+
+    @staticmethod
+    def _warn_long_wait(registration: Any, me: int, waited: float) -> None:
+        """Once per wait: no lock shows a wait such as thread.join(), so a deadlock
+        through one cannot be detected - but it must not stay silent either."""
+        with _WAIT_LOCK:
+            owner = _LOCK_OWNERS.get(id(registration))
+            holds_locks = any(item[0] == me for item in _LOCK_OWNERS.values())
+        message = ("thread %s has waited %.1fs for the creation of %s held by thread %s; "
+                   "if that thread waits for this one (for example thread.join()), this is a deadlock")
+        args = (me, waited, _slot_name(registration.slot), owner[0] if owner else "?")
+        if holds_locks:
+            # A log handler may take locks: while this thread holds a creation lock
+            # the warning waits until it is released (see _flush_warnings).
+            _RESOLVING.__dict__.setdefault("pending", []).append((message, args))
+        else:
+            logger.warning(message, *args)
 
     @staticmethod
     def _release_creation(registration: ServiceRegistration) -> None:
@@ -1025,6 +1175,15 @@ class Container:
         registration.lock.release()
 
     def _resolve_registration(self, registration: ServiceRegistration) -> Any:
+        _RESOLVING.depth = getattr(_RESOLVING, "depth", 0) + 1
+        try:
+            return self._resolve_registration_now(registration)
+        finally:
+            _RESOLVING.depth -= 1
+            if not _RESOLVING.depth:
+                _flush_warnings()  # every creation lock of this thread is released now
+
+    def _resolve_registration_now(self, registration: ServiceRegistration) -> Any:
         service_type = registration.service_type
         if self._closed:
             raise ContainerClosedError("The dependency container is closed")
@@ -1033,7 +1192,11 @@ class Container:
                 self._acquire_creation(registration)
                 try:
                     if registration.instance is _UNSET:
-                        instance = self._create_instance(registration)
+                        token = _SINGLETON_IN_CREATION.set(_slot_name(registration.slot))
+                        try:
+                            instance = self._create_instance(registration)
+                        finally:
+                            _SINGLETON_IN_CREATION.reset(token)
                         self._singleton_order.append(instance)
                         registration.instance = instance
                 finally:
@@ -1045,6 +1208,12 @@ class Container:
                 raise ScopeNotActiveError(
                     f"Scoped service requires an active scope: {service_type.__name__}"
                 )
+            owner = _SINGLETON_IN_CREATION.get()
+            if owner is not None:
+                scoped = _slot_name(registration.slot)
+                _warn_once(("captures", owner, scoped),
+                           "%s (scoped) was resolved while singleton %s was being created; "
+                           "if %s keeps it, it outlives its scope", scoped, owner, owner)
             return scope.get_or_create(registration, self)
         return self._create_instance(registration)
 
@@ -1088,9 +1257,16 @@ class Container:
             try:
                 signature = inspect.signature(implementation.__init__)
                 hints = get_type_hints(implementation.__init__)
-            except (NameError, TypeError, ValueError):
+            except (NameError, TypeError, ValueError) as error:
                 signature = inspect.signature(implementation.__init__)
                 hints = {}
+                _warn_once(
+                    ("hints", implementation.__module__, implementation.__qualname__),
+                    "%s.%s: type hints cannot be resolved (%s: %s); a parameter with a "
+                    "default keeps its default, one without fails to resolve",
+                    implementation.__module__, implementation.__qualname__,
+                    type(error).__name__, error,
+                )
             try:  # Annotated metadata (Keyed) is kept only with include_extras
                 extras = get_type_hints(implementation.__init__, include_extras=True)
             except (NameError, TypeError, ValueError):
@@ -1178,9 +1354,7 @@ class Scope:
         try:
             self.state.close()
         finally:
-            if self._token is not None:
-                self.container._current_scope_var.reset(self._token)
-                self._token = None
+            self._leave()
 
     async def __aenter__(self) -> "Scope":
         return self.__enter__()
@@ -1194,9 +1368,13 @@ class Scope:
         try:
             await self.state.aclose()
         finally:
-            if self._token is not None:
-                self.container._current_scope_var.reset(self._token)
-                self._token = None
+            self._leave()
+
+    def _leave(self) -> None:
+        """Make the scope that was active before this one current again."""
+        if self._token is not None:
+            self.container._current_scope_var.reset(self._token)
+            self._token = None
 
     def resolve(self, service_type: Type[T]) -> T:
         return self.container.resolve(service_type)

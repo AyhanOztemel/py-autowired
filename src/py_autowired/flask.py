@@ -43,5 +43,5 @@ def attach_container(
     app.wsgi_app = WsgiRequestScope(app.wsgi_app, container, startup)
     extensions["py_autowired"] = container
     if close_on_shutdown:
-        atexit.register(container._release_singletons)
+        atexit.register(container._release_singletons_at_exit)
     return app

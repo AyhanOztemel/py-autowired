@@ -7,6 +7,7 @@ application module has been imported.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import sys
 import threading
@@ -125,7 +126,18 @@ class AsgiRequestScope:
         try:
             await self.app(scope, receive, send)
         finally:
-            await request_scope.__aexit__(*sys.exc_info())
+            try:
+                closing = request_scope.state.aclose()
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:  # not asyncio (e.g. trio): no shield available here
+                    await closing
+                else:
+                    # A cancelled request must still close its scoped services. Only
+                    # the closing runs shielded; the scope is left in this context.
+                    await asyncio.shield(closing)
+            finally:
+                request_scope._leave()
 
 
 def is_asgi(application: Any) -> bool:

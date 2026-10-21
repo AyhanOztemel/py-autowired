@@ -85,9 +85,15 @@ def test_03_sync_factory_rejects_and_closes_coroutine(scope):
 def test_04_field_read_failure_warns_and_still_skips(graph, caplog):
     container, patch = graph
     class Consumer:
+        # 0.5.4: only a settable property can be a field (a read-only one can
+        # never receive a value); its failing getter still only warns.
         @property
         def repository_instance(self):
             raise RuntimeError("resource unavailable")
+
+        @repository_instance.setter
+        def repository_instance(self, value):
+            pass
     patch(Consumer)
     with caplog.at_level(logging.WARNING, logger="py_autowired"):
         consumer = Consumer()
