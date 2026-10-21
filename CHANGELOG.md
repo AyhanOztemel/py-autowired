@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.3 - 2026-10-21
+
+### Fixed
+
+- Startup logged a false WARNING `Import failed for <module>: cannot import name
+  ... from partially initialized module ...` when a project file imports the
+  application module while it is still starting (typically `main.py` doing
+  `from app import app`). Discovery cannot load such a file before the
+  application module finishes; 0.4 skipped it silently, 0.5.0-0.5.2 reported it
+  as a failure. It is now recognised (the module it imports is still being
+  imported) and logged at DEBUG only. Nothing is lost: the file's `*_instance`
+  fields are filled when it is imported later. Real failures (missing package,
+  syntax error, missing name in a finished module) are still WARNINGs.
+
 ## 0.5.2 - 2026-10-20
 
 Several implementations of one contract, as in .NET DI and Spring, through the

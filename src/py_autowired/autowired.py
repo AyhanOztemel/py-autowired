@@ -624,8 +624,32 @@ def _find_project_root(start: Optional[Path] = None) -> Path:
     return current
 
 
+def _still_importing(error: BaseException) -> Optional[str]:
+    """Name of the module that is still being imported and caused *error*.
+
+    Discovery usually runs while the application module itself is being
+    imported. A project file that imports that module back (an entry point
+    such as ``main.py`` doing ``from app import app``) then fails with a
+    circular import. That file is not broken: it simply cannot be loaded
+    before the application module finishes. Returns None for real failures.
+    """
+    candidates = []
+    name = getattr(error, "name", None)          # ImportError: ``from X import y``
+    if isinstance(name, str):
+        candidates.append(name)
+    obj = getattr(error, "obj", None)            # AttributeError on a module object
+    if isinstance(obj, type(sys)):
+        candidates.append(obj.__name__)
+    for candidate in candidates:
+        module = sys.modules.get(candidate)
+        spec = getattr(module, "__spec__", None)
+        if getattr(spec, "_initializing", False):
+            return candidate
+    return None
+
+
 def _import_module_safely(dotted_name: str, file_path: str) -> bool:
-    """ORIGINAL FUNCTION - unchanged"""
+    """Import one discovered module; log why it was not loaded."""
     try:
         module = importlib.import_module(dotted_name)
         actual = getattr(module, "__file__", None)
@@ -636,10 +660,15 @@ def _import_module_safely(dotted_name: str, file_path: str) -> bool:
             )
             return False
         return True
-    except ImportError as e:
-        logger.warning(f"Import failed for {dotted_name}: {e}")
-        return False
     except Exception as e:
+        importing = _still_importing(e)
+        if importing is not None:
+            # Not an error: the module imports one that is still loading.
+            logger.debug(
+                "Skipped %s during discovery: it imports %s, which is still being imported",
+                dotted_name, importing,
+            )
+            return False
         logger.warning(f"Import failed for {dotted_name}: {e}")
         return False
 

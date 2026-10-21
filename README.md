@@ -359,6 +359,11 @@ The library logs to `logging.getLogger("py_autowired")` and is silent by
 default. Discovery problems are logged as WARNING. Set `PY_AUTOWIRED_DEBUG=1`
 before import for detailed DEBUG output.
 
+A project file that imports the application module while that module is
+still starting (for example `main.py` doing `from app import app`) cannot be
+loaded during discovery. This is not an error: it is logged at DEBUG only,
+and its `*_instance` fields are still filled when the file is imported later.
+
 ## Notes
 
 - **Concurrency:** ready singletons and cached lookups are lock-free. A

@@ -359,6 +359,11 @@ Kütüphane `logging.getLogger("py_autowired")` üzerinden log yazar ve varsayı
 olarak sessizdir. Tarama sorunları WARNING olarak loglanır. Ayrıntılı DEBUG
 çıktısı için import'tan önce `PY_AUTOWIRED_DEBUG=1` ayarlayın.
 
+Uygulama modülü henüz açılırken onu import eden bir proje dosyası (örneğin
+`from app import app` yapan `main.py`) tarama sırasında yüklenemez. Bu bir hata
+değildir: yalnız DEBUG seviyesinde yazılır ve dosya sonradan import edildiğinde
+`*_instance` alanları yine doldurulur.
+
 ## Notlar
 
 - **Eşzamanlılık:** hazır singleton'lar ve önbellek okumaları kilitsizdir. Bir
