@@ -9,6 +9,7 @@ import importlib.abc
 import importlib.machinery
 import os
 import threading
+import time
 import dis
 import logging
 import weakref
@@ -16,9 +17,14 @@ from functools import wraps
 from pathlib import Path
 from collections import defaultdict
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, Any, Tuple, get_type_hints
+from typing import Dict, Iterable, List, Optional, Any, Tuple, TypeVar
 
-from .container import DependencyInjectionError, Lazy, LifetimeScope, _deferred_wrapper, _keyed_marker, _parameter_hint, _slot_name, _unwrap_annotation, _warn_once
+from .container import (
+    _BACKGROUND_LOG, DependencyInjectionError, Lazy, LifetimeScope, _WARNED, _constructor_hints,
+    _deferred_wrapper, _init_signature, _keyed_marker, _parameter_hint, _signature_of, _slot_name,
+    _unsupported_keyed,
+    _unwrap_annotation, _warn_once, _warn_once_background,
+)
 
 # ============================================================================
 # CONFIGURATION
@@ -52,7 +58,54 @@ _EXCLUDED_DIRS = {
 # Global caches
 _NAME_MAP_CACHE: Optional['_CachedNameMap'] = None
 # 🆕 v2: nogil/free-threaded güvenliği için global kilit
-_GLOBAL_LOCK = threading.RLock()
+_GLOBAL_WAIT_WARNING = 10.0  # seconds a thread may wait for the library lock before a WARNING
+
+
+class _GlobalLock:
+    """The library's re-entrant lock. A blocking acquire that has to wait polls;
+    after _GLOBAL_WAIT_WARNING seconds it reports, once, which thread holds the
+    lock (the holder may be waiting for this one). Uncontended: one acquire."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._owner: Optional[int] = None
+        self._depth = 0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if not blocking or timeout >= 0:
+            got = self._lock.acquire(blocking, timeout)
+        else:
+            got = self._lock.acquire(blocking=False) or self._wait()
+        if got:
+            self._owner = threading.get_ident()
+            self._depth += 1
+        return got
+
+    def _wait(self) -> bool:
+        started, warned = time.monotonic(), False
+        while not self._lock.acquire(timeout=0.05):
+            if not warned and time.monotonic() - started >= _GLOBAL_WAIT_WARNING:
+                warned = True
+                _BACKGROUND_LOG.put(
+                    "thread %s has waited %.1fs for the py_autowired lock held by thread %s; "
+                    "if that thread waits for this one (for example thread.join()), this is a deadlock",
+                    (threading.get_ident(), time.monotonic() - started, self._owner))
+        return True
+
+    def release(self) -> None:
+        self._depth -= 1
+        if not self._depth:
+            self._owner = None
+        self._lock.release()
+
+    def __enter__(self) -> bool:
+        return self.acquire()
+
+    def __exit__(self, *exc_info) -> None:
+        self.release()
+
+
+_GLOBAL_LOCK = _GlobalLock()
 _PATCHED_CLASSES = {}
 
 
@@ -88,6 +141,7 @@ def _forget_untracked(key, entries):
 
 
 _UNTRACKED: Dict[int, List[str]] = {}  # id(container) -> issues validation must report
+_PINNED: Dict[int, Any] = {}  # id -> container that cannot be weakly referenced
 
 
 def _record_issue(container, text: str) -> None:
@@ -101,7 +155,9 @@ def _record_issue(container, text: str) -> None:
             try:
                 weakref.finalize(container, _forget_untracked, key, entries)
             except TypeError:
-                pass  # a non-weakrefable container keeps its entries
+                # No finalizer possible: keep the container alive, so its id can
+                # never be given to another container that would inherit these.
+                _PINNED[key] = container
         if text not in entries:
             entries.append(text)
 
@@ -138,9 +194,9 @@ def _remember_patched_class(container, cls):
             try:
                 weakref.finalize(container, _forget_patched_classes, key, _PATCHED_CLASSES[key])
             except TypeError:
-                # A non-weakrefable duck-typed container remains supported.
-                # Live class wrappers already hold their container by identity.
-                pass
+                # A non-weakrefable duck-typed container remains supported; it is
+                # kept alive so that its id is never reused by another container.
+                _PINNED[key] = container
         _PATCHED_CLASSES[key][id(cls)] = cls
 
 class AutowiringValidationError(DependencyInjectionError):
@@ -556,11 +612,61 @@ def _patch_setattr(cls, container, name_map):
                         f"{cls.__module__}.{cls.__name__}.{name}: "
                         f"{reg.service_type.__name__} could not be resolved"
                     ) from e
+            else:
+                _warn_once(("unregistered", cls.__module__, cls.__qualname__, name),
+                           "%s.%s.%s: no matching registration; the field stays None",
+                           cls.__module__, cls.__qualname__, name)
 
         return orig_setattr(self, name, value)
 
     cls.__setattr__ = __setattr__
     cls.__ai_ioc_setattr__ = True
+
+
+def _inject_fields(self, cls, container, name_map, di_candidates) -> None:
+    """Post-init injection: fill the *_instance fields of one object that are still None."""
+    # 🆕 v2: dir(self) yerine önceden hesaplanmış aday listesi
+    for attr in di_candidates:
+        try:
+            val = getattr(self, attr)
+        except Exception:
+            logger.warning(
+                "Field read failed for %s.%s.%s; field skipped (it keeps its current value)",
+                cls.__module__, cls.__qualname__, attr, exc_info=True,
+            )
+            continue
+
+        if val is not None:
+            continue
+
+        normalized_base = _field_key(attr)
+
+        if DEBUG_MODE:
+            logger.debug(f"Post-init lookup: {attr!r} as {normalized_base!r} (class: {cls.__name__}, module: {cls.__module__})")
+
+        resolution_container, reg = _lookup_registration(
+            container, name_map, normalized_base, cls.__module__
+        )
+
+        if not reg:
+            _warn_once(("unregistered", cls.__module__, cls.__qualname__, attr),
+                       "%s.%s.%s: no matching registration; the field stays None",
+                       cls.__module__, cls.__qualname__, attr)
+            continue
+
+        try:
+            injected = _resolve_via_container(resolution_container, reg, isinstance(normalized_base, tuple))
+            setattr(self, attr, injected)
+            if DEBUG_MODE:
+                impl = (reg.implementation_type or reg.service_type).__name__
+                logger.debug(f"{cls.__name__}.{attr} <- {impl} (post-init injection)")
+        except Exception as e:
+            if DEBUG_MODE:
+                logger.debug(f"Post-init injection failed: {e}")
+            raise AutoInjectionResolutionError(
+                f"{cls.__module__}.{cls.__name__}.{attr}: "
+                f"{reg.service_type.__name__} could not be resolved"
+            ) from e
 
 
 def _patch_init(cls, container, name_map):
@@ -585,49 +691,7 @@ def _patch_init(cls, container, name_map):
     def __init__(self, *args, **kwargs):
         # A non-callable __init__ fails exactly as it would without the patch.
         orig_init(self, *args, **kwargs)
-
-        # 🆕 v2: dir(self) yerine önceden hesaplanmış aday listesi
-        for attr in di_candidates:
-            try:
-                val = getattr(self, attr)
-            except Exception:
-                logger.warning(
-                    "Field read failed for %s.%s.%s; field skipped (it keeps its current value)",
-                    cls.__module__, cls.__qualname__, attr, exc_info=True,
-                )
-                continue
-
-            if val is not None:
-                continue
-
-            normalized_base = _field_key(attr)
-
-            if DEBUG_MODE:
-                logger.debug(f"Post-init lookup: {attr!r} as {normalized_base!r} (class: {cls.__name__}, module: {cls.__module__})")
-
-            resolution_container, reg = _lookup_registration(
-                container, name_map, normalized_base, cls.__module__
-            )
-
-            if not reg:
-                _warn_once(("unregistered", cls.__module__, cls.__qualname__, attr),
-                           "%s.%s.%s: no matching registration; the field stays None",
-                           cls.__module__, cls.__qualname__, attr)
-                continue
-
-            try:
-                injected = _resolve_via_container(resolution_container, reg, isinstance(normalized_base, tuple))
-                setattr(self, attr, injected)
-                if DEBUG_MODE:
-                    impl = (reg.implementation_type or reg.service_type).__name__
-                    logger.debug(f"{cls.__name__}.{attr} <- {impl} (post-init injection)")
-            except Exception as e:
-                if DEBUG_MODE:
-                    logger.debug(f"Post-init injection failed: {e}")
-                raise AutoInjectionResolutionError(
-                    f"{cls.__module__}.{cls.__name__}.{attr}: "
-                    f"{reg.service_type.__name__} could not be resolved"
-                ) from e
+        _inject_fields(self, cls, container, name_map, di_candidates)
 
     # 🆕 v2: __name__ kopyalamak yerine functools.wraps + imza koruması —
     #        FastAPI/pydantic gibi introspection yapan araçlar bozulmaz.
@@ -637,7 +701,7 @@ def _patch_init(cls, container, name_map):
         except Exception:
             __init__.__name__ = getattr(orig_init, "__name__", "__init__")
         try:
-            __init__.__signature__ = inspect.signature(orig_init)
+            __init__.__signature__ = _signature_of(orig_init, cls)
         except (ValueError, TypeError):
             pass
     else:
@@ -779,7 +843,7 @@ def _import_module_safely(dotted_name: str, file_path: str) -> bool:
             if _DISCOVERING:
                 _DISCOVERING[-1]["skipped"].append((dotted_name, importing))
             return False
-        logger.warning(f"Import failed for {dotted_name}: {e}")
+        logger.warning(f"Import failed for {dotted_name}: {e}", exc_info=True)
         if _DISCOVERING:
             _DISCOVERING[-1]["failed"].append(f"{dotted_name}: could not be imported during discovery ({e!r})")
         return False
@@ -999,10 +1063,12 @@ def _check_deferred(module, container, name_map):
     except Exception as error:
         failure = AutowiringValidationError([f"{name}: could not be checked: {error!r}"])
         failure.__cause__ = error
+        # Its classes may be untracked: validation must still report it later.
+        _record_issue(container, failure.issues[0])
     else:
-        logger.info("Checked %s after it loaded (it was skipped during discovery): no wiring problems", name)
+        logger.info("Checked %s after it loaded: no wiring problems", name)
         return None
-    logger.error("%s was skipped during discovery and has wiring problems now that it is loaded:\n%s",
+    logger.error("%s has wiring problems now that it is loaded:\n%s",
                  name, "\n".join(f"- {issue}" for issue in failure.issues))
     return failure if strict else None
 
@@ -1055,10 +1121,14 @@ def _load_skipped() -> None:
         except AutowiringValidationError as error:
             failure = failure or error
         except Exception as error:
-            logger.warning(f"Import failed for {name}: {error}")
+            issue = f"{name}: could not be imported after startup ({error!r})"
+            # This may run inside a resolution: the background writer logs it.
+            _BACKGROUND_LOG.put("Import failed for %s: %s", (name, error), sys.exc_info())
             cache = _NAME_MAP_CACHE
             if cache is not None:
-                _record_issue(cache._container, f"{name}: could not be imported after startup ({error!r})")
+                _record_issue(cache._container, issue)
+            if _DEFERRED.get(name):  # validate=True: an exception, not only a log line
+                failure = failure or AutowiringValidationError([issue])
     with _GLOBAL_LOCK:
         cache = _NAME_MAP_CACHE
         if cache is not None:
@@ -1095,6 +1165,8 @@ def _drain_late_modules() -> dict:
             # validation issue, not a passing note.
             logger.error("Could not patch late-imported module %s", module.__name__, exc_info=True)
             _record_issue(cache._container, f"{module.__name__}: could not be patched ({error!r})")
+        if module.__name__ not in _DEFERRED and _is_validating(cache._container):
+            _DEFERRED[module.__name__] = True  # validate=True: every late module is checked
         error = _check_deferred(module, cache._container, name_map)
         if error is not None:
             failed[module.__name__] = error
@@ -1105,6 +1177,16 @@ def _drain_late_modules() -> dict:
     return failed
 
 
+_VALIDATING = weakref.WeakSet()  # containers whose auto_inject() had validate=True
+# The same for a container that cannot be weakly referenced: kept alive (as in _PINNED),
+# so its id is never given to another object.
+_VALIDATING_PINNED: Dict[int, Any] = {}
+
+
+def _is_validating(container) -> bool:
+    return container in _VALIDATING or id(container) in _VALIDATING_PINNED
+
+
 def _patch_late_module(module) -> None:
     if getattr(_STARTUP, "active", False):
         return  # auto_inject() patches (and checks) every module it loads itself
@@ -1112,6 +1194,10 @@ def _patch_late_module(module) -> None:
     # very import; the module is then queued for the next lock holder.
     if not _GLOBAL_LOCK.acquire(timeout=0.5):
         _PENDING_LATE_MODULES.append(module)
+        _warn_once_background(
+            ("queued", module.__name__),
+            "%s was imported while py_autowired was busy; its classes are patched as soon as "
+            "the lock is free - objects created before that get no injection", module.__name__)
         # No other lock holder may ever come: finish it as soon as the lock is free.
         threading.Thread(target=_drain_when_free, name="py_autowired-late-import", daemon=True).start()
         return
@@ -1244,6 +1330,13 @@ def auto_inject(
         loaded_count = _discover_and_load_modules(root)
     else:
         loaded_count = _discover_and_load_modules(root, exclude_dirs)
+    try:
+        (_VALIDATING.add if validate else _VALIDATING.discard)(container)
+    except TypeError:  # it cannot be weakly referenced
+        if validate:
+            _VALIDATING_PINNED[id(container)] = container
+        else:
+            _VALIDATING_PINNED.pop(id(container), None)
     for name in _SKIPPED:
         _DEFERRED[name] = validate
         _AWAITING[name] = _BLOCKERS[name]
@@ -1343,6 +1436,26 @@ def _open_fields(cls):
         yield name
 
 
+_INJECTED_FIELDS = weakref.WeakKeyDictionary()  # class -> its *_instance fields, for injected()
+
+
+def _inject_unpatched(instance, container) -> None:
+    """injected() built an object of a class discovery never patched (outside the
+    project root, or created after startup): fill the None fields of that ONE
+    object. The class is not changed - modules outside the project are never
+    touched - so a field used inside __init__ right after ``= None`` is not
+    filled yet there."""
+    cls = type(instance)
+    if cls.__dict__.get("__ai_ioc_init__", False):
+        return  # its patched __init__ has filled it
+    try:
+        candidates = _INJECTED_FIELDS[cls]
+    except KeyError:
+        candidates = _INJECTED_FIELDS[cls] = _find_di_candidates(cls)
+    name_map = {} if _NAME_MAP_CACHE is not None else _build_name_map_from_container(container)
+    _inject_fields(instance, cls, container, name_map, candidates)
+
+
 def _warn_equal_candidates(container, name_map) -> None:
     """ONE startup WARNING listing every field whose best candidates tie.
 
@@ -1361,9 +1474,19 @@ def _warn_equal_candidates(container, name_map) -> None:
             if len(tied) > 1:
                 lines.append(f"{cls.__module__}.{cls.__qualname__}.{name}: "
                              + ", ".join(_registration_label(reg) for reg in tied))
-    if lines:
-        logger.warning("%d fields have equally good candidates; the first registered one is used:\n%s",
-                       len(lines), "\n".join(f"- {line}" for line in lines))
+    if not lines:
+        return
+    try:
+        if _REPORTED_TIES.get(container) == lines:
+            return  # already reported (auto_inject() and refresh() call this)
+        _REPORTED_TIES[container] = lines
+    except TypeError:
+        pass
+    logger.warning("%d fields have equally good candidates; the first registered one is used:\n%s",
+                   len(lines), "\n".join(f"- {line}" for line in lines))
+
+
+_REPORTED_TIES = weakref.WeakKeyDictionary()  # container -> tie lines last reported
 
 
 def _warn_missing_implementations(container) -> None:
@@ -1430,8 +1553,10 @@ def refresh():
             return False
         _NAME_MAP_CACHE.refresh()
         failed = _drain_late_modules()
+        cache = _NAME_MAP_CACHE
         if DEBUG_MODE:
             logger.debug("Name map refreshed; resolution cache cleared")
+    _warn_equal_candidates(cache._container, cache.get_raw_map())  # new registrations may tie
     # The refresh is complete; now report what the drained imports found.
     _raise_first(failed)
     _load_skipped()
@@ -1571,7 +1696,7 @@ def _validate_autowiring(container, classes, skipped=(), untracked=()):
         if inspect.isabstract(impl) and not lifetime_only:
             return [f"{impl.__name__} is abstract"]
         try:
-            signature = inspect.signature(impl.__init__)
+            signature = _init_signature(impl)
         except (TypeError, ValueError) as error:
             if lifetime_only:
                 return []
@@ -1593,33 +1718,26 @@ def _validate_autowiring(container, classes, skipped=(), untracked=()):
         if not (getattr(impl, "__di_attrs__", ()) and all(
             p.default is not inspect.Parameter.empty for p in parameters
         )):
-            hint_error = None
-            try:
-                hints = get_type_hints(impl.__init__)
-            except (NameError, TypeError, ValueError) as error:
-                hints, hint_error = {}, error
-            try:
-                extras = get_type_hints(impl.__init__, include_extras=True)
-            except (NameError, TypeError, ValueError):
-                extras = {}
+            hints, extras, hint_error = _constructor_hints(impl.__init__)
             keyed_registrations = getattr(container, "_keyed", {})
             for parameter in parameters:
-                # The container passes arguments by name: a positional-only one fails.
-                positional_only = (parameter.kind is inspect.Parameter.POSITIONAL_ONLY
-                                   and not lifetime_only)
-                positional_issue = (f"{impl.__name__}.{parameter.name} is positional-only; "
-                                    "the container passes arguments by name")
-                keyed = _keyed_marker(extras.get(parameter.name, parameter.annotation))
+                hint = extras.get(parameter.name, parameter.annotation)
+                keyed = _keyed_marker(hint)
+                if keyed is None and not lifetime_only:
+                    unsupported = _unsupported_keyed(impl, parameter, hint)
+                    if unsupported is not None:
+                        problems.append(unsupported)
                 if keyed is not None:
                     child = keyed_registrations.get(keyed)
-                    if child is not None and positional_only:
-                        problems.append(positional_issue)
-                    elif child is not None:
+                    if child is not None:
                         problems.extend(construction_problems(child, path, singleton_owner, lifetime_only))
                     elif not lifetime_only and parameter.default is inspect.Parameter.empty:
                         problems.append(f"{impl.__name__}.{parameter.name} requires unregistered keyed {keyed!r}")
                     continue
                 annotation = _unwrap_annotation(_parameter_hint(parameter, hints))
+                typevar_map = getattr(reg, "typevar_map", None)
+                if typevar_map and isinstance(annotation, TypeVar):
+                    annotation = typevar_map.get(annotation, annotation)  # as the container does
                 if hint_error is not None and isinstance(annotation, str):
                     # The container cannot resolve it either: without a default it
                     # fails, with one the default silently replaces injection.
@@ -1637,22 +1755,25 @@ def _validate_autowiring(container, classes, skipped=(), untracked=()):
                 if deferred is not None:
                     # Provider[X] defers every resolution: never a capture. Lazy[X]
                     # keeps the first value: in a singleton that is a capture.
-                    if not lifetime_only and deferred[1] not in registrations:
-                        problems.append(f"{impl.__name__}.{parameter.name} defers an unregistered dependency ({deferred[1]!r})")
                     inner = registrations.get(deferred[1])
+                    if inner is None and hasattr(container, "_closed_generic_registration"):
+                        inner = container._closed_generic_registration(deferred[1], cache=False)
+                    if not lifetime_only and inner is None:
+                        problems.append(f"{impl.__name__}.{parameter.name} defers an unregistered dependency ({deferred[1]!r})")
                     if (deferred[0] is Lazy and singleton_owner is not None and inner is not None
                             and inner.scope == LifetimeScope.SCOPED):
                         problems.append(f"singleton {singleton_owner.__name__} captures scoped "
                                         f"{inner.service_type.__name__} through Lazy (it keeps the first value)")
-                    if positional_only:
-                        problems.append(positional_issue)
+                    elif deferred[0] is Lazy and singleton_owner is not None and inner is not None:
+                        # What the Lazy builds is kept too: follow it for captures only
+                        # (lifetime_only: a Lazy that breaks a cycle is no problem).
+                        problems.extend(f"{problem} (through Lazy)" for problem in
+                                        construction_problems(inner, path, singleton_owner, True))
                     continue
                 child = registrations.get(annotation)
                 if child is None and hasattr(container, "_closed_generic_registration"):
                     child = container._closed_generic_registration(annotation, cache=False)
-                if annotation is not inspect.Parameter.empty and child is not None and positional_only:
-                    problems.append(positional_issue)
-                elif annotation is not inspect.Parameter.empty and child is not None:
+                if annotation is not inspect.Parameter.empty and child is not None:
                     problems.extend(construction_problems(child, path, singleton_owner, lifetime_only))
                 elif (not lifetime_only and annotation is inspect.Parameter.empty
                       and parameter.default is inspect.Parameter.empty):

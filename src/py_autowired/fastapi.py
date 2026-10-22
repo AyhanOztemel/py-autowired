@@ -16,7 +16,7 @@ from anyio import CancelScope
 from fastapi import FastAPI, Request
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .autowired import _find_project_root, activate_container, auto_inject
+from .autowired import _find_project_root, _inject_unpatched, activate_container, auto_inject
 from .container import Container
 
 
@@ -110,13 +110,18 @@ def injected(service_type: type[T]) -> Callable[[Request], Coroutine[Any, Any, T
 
     Registered types retain their configured lifetime. Unregistered controller
     classes are constructed without arguments and receive the same automatic
-    field injection. Dependencies are async so resolution stays in the request
+    field injection. A class discovery never patched (outside the project root,
+    or created after startup) is not changed: the None fields of the object built
+    here are filled after its ``__init__`` returns, so ``__init__`` itself cannot
+    use them yet. Dependencies are async so resolution stays in the request
     context even when the endpoint itself is synchronous.
     """
     async def dependency(request: Request) -> T:
         container: Container = request.app.state.py_autowired_container
         if container.is_registered(service_type):
             return container.resolve(service_type)
-        return service_type()
+        instance = service_type()
+        _inject_unpatched(instance, container)
+        return instance
 
     return dependency

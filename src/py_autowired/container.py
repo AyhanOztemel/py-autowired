@@ -9,9 +9,12 @@ from enum import Enum
 from functools import lru_cache, wraps
 import inspect
 import logging
+import queue
 import re
+import sys
 import threading
 import time
+import types
 from types import TracebackType
 from typing import Annotated, Any, Callable, Dict, Generic, Optional, Type, TypeVar, Union, get_args, get_origin, get_type_hints
 
@@ -35,6 +38,59 @@ def _warn_once(key, message: str, *args: Any) -> None:
         _RESOLVING.__dict__.setdefault("pending", []).append((message, args))
     else:
         logger.warning(message, *args)
+
+
+class _BackgroundLog:
+    """One lazily started daemon thread that writes the warnings of threads that
+    must not run log handlers themselves (they wait, or hold library locks).
+    put() never waits for a handler; when the queue is full the oldest entry is
+    dropped and the number dropped is written with the next one."""
+
+    def __init__(self, size: int = 256) -> None:
+        self._queue: "queue.Queue[tuple]" = queue.Queue(maxsize=size)
+        self._count = threading.Lock()  # guards _dropped only; never held while logging
+        self._dropped = 0
+        self._start = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+
+    def put(self, message: str, args: tuple, exc_info: Any = None) -> None:
+        while True:
+            try:
+                self._queue.put_nowait((message, args, exc_info))
+                break
+            except queue.Full:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    continue
+                with self._count:
+                    self._dropped += 1
+        if self._thread is None:
+            with self._start:
+                if self._thread is None:
+                    self._thread = threading.Thread(
+                        target=self._run, name="py_autowired-log", daemon=True)
+                    self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            message, args, exc_info = self._queue.get()
+            with self._count:
+                dropped, self._dropped = self._dropped, 0
+            if dropped:
+                logger.warning("%d py_autowired warnings were dropped (the warning queue was full)", dropped)
+            logger.warning(message, *args, exc_info=exc_info)
+
+
+_BACKGROUND_LOG = _BackgroundLog()
+
+
+def _warn_once_background(key, message: str, *args: Any) -> None:
+    """_warn_once for a thread that must not run log handlers itself."""
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    _BACKGROUND_LOG.put(message, args)
 
 
 def _flush_warnings() -> None:
@@ -111,17 +167,25 @@ def _raise_disposal_errors(errors: list) -> None:
             except Exception:  # a broken __str__ must not mask the first error
                 text = "<unprintable>"
             note = f"Additional disposal error: {type(error).__name__}: {text}"
+            reported = False
             try:  # the note first: a failing log handler must not lose it
                 if hasattr(first, "add_note"):
                     first.add_note(note)
                 else:  # Python 3.10 has no add_note(); same __notes__ contract.
                     first.__notes__ = [*getattr(first, "__notes__", ()), note]
+                reported = True
             except Exception:
                 pass
             try:
                 logger.error(note, exc_info=(type(error), error, error.__traceback__))
+                reported = True
             except Exception:
                 pass
+            if not reported:  # both channels failed: the last resort
+                try:
+                    sys.stderr.write(note + "\n")
+                except Exception:
+                    pass
     finally:
         raise first
 
@@ -212,10 +276,101 @@ def _concrete_subclasses(service_type: Type[Any]) -> list[Type[Any]]:
 # bounded cache keeps dynamically built classes from accumulating. Re-patching a
 # class cannot stale the answer: auto_inject copies the original __signature__
 # onto the wrapper it installs.
+def _read_signature(function: Any) -> inspect.Signature:
+    """``inspect.signature``; on 3.14+ an annotation that cannot be evaluated yet
+    no longer breaks it: the annotations are then read as strings (what ``from
+    __future__ import annotations`` gives) and the hint problem is reported where
+    type hints are read."""
+    try:
+        return inspect.signature(function)
+    except NameError:
+        if sys.version_info < (3, 14):
+            raise
+        import annotationlib
+        return inspect.signature(function, annotation_format=annotationlib.Format.STRING)
+
+
+def _signature_from_code(function: Any) -> Optional[inspect.Signature]:
+    """The signature of a plain function read from its own code (the parameters
+    Python really checks), ignoring a ``__signature__`` that cannot be read."""
+    try:
+        target = inspect.unwrap(function)
+    except ValueError:
+        return None
+    if not isinstance(target, types.FunctionType):
+        return None
+    clone = types.FunctionType(target.__code__, target.__globals__, target.__name__,
+                               target.__defaults__, target.__closure__)
+    clone.__kwdefaults__ = target.__kwdefaults__
+    annotate = getattr(target, "__annotate__", None)
+    if annotate is not None:  # 3.14+: keep the annotations deferred
+        clone.__annotate__ = annotate
+    else:
+        clone.__annotations__ = dict(getattr(target, "__annotations__", None) or {})
+    try:
+        return _read_signature(clone)
+    except (TypeError, ValueError):
+        return None
+
+
+def _signature_of(function: Any, owner: Any) -> inspect.Signature:
+    """The signature, also where ``inspect.signature`` fails although the
+    parameters are known (see ``_read_signature``). A ``__signature__`` that
+    cannot be read is rebuilt from the function's code. Any other error - and a
+    callable without code - raises as before.
+    """
+    try:
+        return _read_signature(function)
+    except (TypeError, ValueError) as error:
+        rebuilt = _signature_from_code(function)
+        if rebuilt is None:
+            raise
+        module = getattr(owner, "__module__", "?")
+        name = getattr(owner, "__qualname__", repr(owner))
+        _warn_once(("rebuilt-signature", module, name),
+                   "%s.%s: its __signature__ cannot be read (%r); the signature is rebuilt "
+                   "from its code", module, name, error)
+        return rebuilt
+
+
+def _init_signature(implementation: Type[Any]) -> inspect.Signature:
+    return _signature_of(implementation.__init__, implementation)
+
+
+def _has_metadata(hint: Any) -> bool:
+    if get_origin(hint) is Annotated:
+        return True
+    for argument in get_args(hint):
+        arguments = argument if isinstance(argument, (list, tuple)) else (argument,)
+        if any(_has_metadata(item) for item in arguments):
+            return True
+    return False
+
+
+def _constructor_hints(function: Any) -> tuple[Dict[str, Any], Dict[str, Any], Optional[Exception]]:
+    """(plain hints, hints with metadata, error), read in one pass.
+
+    The plain view is the same dict unless a hint carries metadata (Keyed); only
+    then is it read again. One failure fails both: Keyed metadata is never lost
+    while the plain hints resolve, so a keyed parameter can never fall back to
+    the unkeyed registration.
+    """
+    try:
+        extras = get_type_hints(function, include_extras=True)
+    except (NameError, TypeError, ValueError) as error:
+        return {}, {}, error
+    if not any(_has_metadata(hint) for hint in extras.values()):
+        return extras, extras, None
+    try:
+        return get_type_hints(function), extras, None
+    except (NameError, TypeError, ValueError) as error:
+        return {}, extras, error
+
+
 @lru_cache(maxsize=1024)
 def _accepts_no_arguments(implementation: Type[Any]) -> bool:
     try:
-        signature = inspect.signature(implementation.__init__)
+        signature = _init_signature(implementation)
     except (TypeError, ValueError):
         return True
     for parameter in list(signature.parameters.values())[1:]:
@@ -253,13 +408,15 @@ class Provider(Generic[T]):
 class Lazy(Generic[T]):
     """Resolve ``service_type`` once, on first ``.value`` access."""
 
-    __slots__ = ("_container", "_service_type", "_value", "_lock", "_resolving")
+    __slots__ = ("_container", "_service_type", "_value", "_gate", "_resolving")
 
     def __init__(self, container: "Container", service_type: Type[T]) -> None:
         self._container = container
         self._service_type = service_type
         self._value: Any = _UNSET
-        self._lock = threading.Lock()  # per-Lazy; never on the container path
+        # Taken like a singleton's creation lock: a cycle across threads raises,
+        # a hidden wait is reported (creation_wait_warning).
+        self._gate = _CreationGate(self)
         self._resolving: Optional[int] = None  # thread that is resolving the value now
 
     @property
@@ -271,13 +428,17 @@ class Lazy(Generic[T]):
                 raise CircularDependencyError(
                     f"{self!r}.value was read again while it is being resolved"
                 )
-            with self._lock:
+            container = self._container
+            container._acquire_creation(self._gate)
+            try:
                 if self._value is _UNSET:
                     self._resolving = threading.get_ident()
                     try:
-                        self._value = self._container.resolve(self._service_type)
+                        self._value = container.resolve(self._service_type)
                     finally:
                         self._resolving = None
+            finally:
+                container._release_creation(self._gate)
         return self._value
 
     @property
@@ -306,14 +467,53 @@ class Keyed:
         return f"Keyed({self.key!r})"
 
 
+_UNION_ORIGINS = (Union, getattr(types, "UnionType", Union))
+
+
+def _without_none(annotation: Any) -> Any:
+    """``T`` for ``Optional[T]``, ``Union[T, None]`` and ``T | None``; else unchanged."""
+    if get_origin(annotation) in _UNION_ORIGINS:
+        args = get_args(annotation)
+        if len(args) == 2 and type(None) in args:
+            return args[0] if args[1] is type(None) else args[1]
+    return annotation
+
+
 def _keyed_marker(annotation: Any) -> Optional[tuple[Any, Any]]:
-    """Return (type, key) for ``Annotated[T, Keyed(key)]``, else None."""
+    """Return (type, key) for ``Annotated[T, Keyed(key)]``, also as an optional
+    dependency - inside ``Optional``/``| None``, or ``Annotated[Optional[T], ...]`` -
+    else None."""
+    annotation = _without_none(annotation)
     if get_origin(annotation) is Annotated:
         args = get_args(annotation)
         for meta in args[1:]:
             if isinstance(meta, Keyed):
-                return args[0], meta.key
+                return _without_none(args[0]), meta.key
     return None
+
+
+def _stray_keyed(annotation: Any) -> Optional[Keyed]:
+    """A Keyed marker anywhere in a hint (for a form ``_keyed_marker`` does not take)."""
+    if get_origin(annotation) is Annotated:
+        for meta in get_args(annotation)[1:]:
+            if isinstance(meta, Keyed):
+                return meta
+    for argument in get_args(annotation):
+        for item in argument if isinstance(argument, (list, tuple)) else (argument,):
+            found = _stray_keyed(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _unsupported_keyed(owner: Any, parameter: inspect.Parameter, hint: Any) -> Optional[str]:
+    """The line for a Keyed marker that would be ignored, else None."""
+    marker = _stray_keyed(hint)
+    if marker is None:
+        return None
+    return (f"{owner.__name__}.{parameter.name}: Keyed({marker.key!r}) is in a form that is not "
+            f"supported ({hint!r}); it is ignored - write Annotated[T, Keyed(key)], "
+            "optionally inside Optional[...]")
 
 
 # Cross-thread cycle detection for FIRST singleton creation only. The small
@@ -409,7 +609,8 @@ class _CreationGate:
 
 
 class _ScopeState:
-    def __init__(self) -> None:
+    def __init__(self, container: "Container") -> None:
+        self.container = container
         self.instances: Dict[Type[Any], Any] = {}
         self.creation_order: list[Type[Any]] = []
         # Guards the dictionaries only; user code never runs under it.
@@ -503,8 +704,9 @@ class _ScopeState:
                     )
             self.closed = True
         for gate in gates:
-            with gate.lock:
-                pass
+            # Through the wait-for graph: a lock cycle raises, a hidden wait is reported.
+            self.container._acquire_creation(gate)
+            self.container._release_creation(gate)
         with self.lock:
             return list(self.creation_order)
 
@@ -1148,19 +1350,14 @@ class Container:
     @staticmethod
     def _warn_long_wait(registration: Any, me: int, waited: float) -> None:
         """Once per wait: no lock shows a wait such as thread.join(), so a deadlock
-        through one cannot be detected - but it must not stay silent either."""
+        through one cannot be detected - but it must not stay silent either. The
+        background writer logs it now, even while this thread stays stuck."""
         with _WAIT_LOCK:
             owner = _LOCK_OWNERS.get(id(registration))
-            holds_locks = any(item[0] == me for item in _LOCK_OWNERS.values())
-        message = ("thread %s has waited %.1fs for the creation of %s held by thread %s; "
-                   "if that thread waits for this one (for example thread.join()), this is a deadlock")
-        args = (me, waited, _slot_name(registration.slot), owner[0] if owner else "?")
-        if holds_locks:
-            # A log handler may take locks: while this thread holds a creation lock
-            # the warning waits until it is released (see _flush_warnings).
-            _RESOLVING.__dict__.setdefault("pending", []).append((message, args))
-        else:
-            logger.warning(message, *args)
+        _BACKGROUND_LOG.put(
+            "thread %s has waited %.1fs for the creation of %s held by thread %s; "
+            "if that thread waits for this one (for example thread.join()), this is a deadlock",
+            (me, waited, _slot_name(registration.slot), owner[0] if owner else "?"))
 
     @staticmethod
     def _release_creation(registration: ServiceRegistration) -> None:
@@ -1254,31 +1451,42 @@ class Container:
                 implementation
             ):
                 return implementation()
-            try:
-                signature = inspect.signature(implementation.__init__)
-                hints = get_type_hints(implementation.__init__)
-            except (NameError, TypeError, ValueError) as error:
-                signature = inspect.signature(implementation.__init__)
-                hints = {}
+            signature = _init_signature(implementation)
+            hints, extras, hint_error = _constructor_hints(implementation.__init__)
+            if hint_error is not None:
                 _warn_once(
                     ("hints", implementation.__module__, implementation.__qualname__),
                     "%s.%s: type hints cannot be resolved (%s: %s); a parameter with a "
                     "default keeps its default, one without fails to resolve",
                     implementation.__module__, implementation.__qualname__,
-                    type(error).__name__, error,
+                    type(hint_error).__name__, hint_error,
                 )
-            try:  # Annotated metadata (Keyed) is kept only with include_extras
-                extras = get_type_hints(implementation.__init__, include_extras=True)
-            except (NameError, TypeError, ValueError):
-                extras = {}
+            parameters = list(signature.parameters.values())[1:]
             arguments: dict[str, Any] = {}
-            for parameter in list(signature.parameters.values())[1:]:
+            for parameter in parameters:
                 if parameter.kind in {
                     inspect.Parameter.VAR_POSITIONAL,
                     inspect.Parameter.VAR_KEYWORD,
                 }:
                     continue
-                keyed = _keyed_marker(extras.get(parameter.name, parameter.annotation))
+                if (hint_error is not None and parameter.default is not inspect.Parameter.empty
+                        and isinstance(parameter.annotation, str) and "Keyed(" in parameter.annotation):
+                    _warn_once(
+                        ("keyed-default", implementation.__module__, implementation.__qualname__,
+                         parameter.name),
+                        "%s.%s.%s: Keyed type hint %s cannot be resolved (%s: %s); the default "
+                        "value is used even if that keyed service is registered",
+                        implementation.__module__, implementation.__qualname__, parameter.name,
+                        parameter.annotation, type(hint_error).__name__, hint_error,
+                    )
+                hint = extras.get(parameter.name, parameter.annotation)
+                keyed = _keyed_marker(hint)
+                if keyed is None and extras is not hints:  # only a hint with metadata can hold one
+                    unsupported = _unsupported_keyed(implementation, parameter, hint)
+                    if unsupported is not None:
+                        _warn_once(("unsupported-keyed", implementation.__module__,
+                                    implementation.__qualname__, parameter.name),
+                                   "%s.%s", implementation.__module__, unsupported)
                 if keyed is not None:
                     keyed_type, key = keyed
                     if self.is_keyed_registered(keyed_type, key):
@@ -1308,6 +1516,12 @@ class Container:
                     raise ServiceNotRegisteredError(
                         f"{implementation.__name__}.{parameter.name} requires unregistered {annotation!r}"
                     )
+            positional = [p for p in parameters if p.kind is inspect.Parameter.POSITIONAL_ONLY]
+            if positional:
+                # Positional-only parameters go by position: a skipped one is passed
+                # its own default (a skipped one never lacks a default: that fails above).
+                values = [arguments.pop(p.name, p.default) for p in positional]
+                return implementation(*values, **arguments)
             return implementation(**arguments)
         finally:
             self._resolution_stack.reset(token)
@@ -1336,7 +1550,7 @@ class Scope:
 
     def __init__(self, container: Container) -> None:
         self.container = container
-        self.state = _ScopeState()
+        self.state = _ScopeState(container)
         self._token: Optional[contextvars.Token[Optional[_ScopeState]]] = None
 
     def __enter__(self) -> "Scope":

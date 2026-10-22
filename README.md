@@ -213,8 +213,9 @@ auto_inject(container, validate=True)             # console
 ```
 
 It lists fields with no matching registration, equally good candidates,
-constructor dependencies that cannot be resolved (also an unreadable signature,
-a type hint that cannot be resolved, or a positional-only parameter), dependency
+constructor dependencies that cannot be resolved (also a signature that cannot
+be read or rebuilt, a type hint that cannot be resolved, or a `Keyed` marker in
+a form that is not supported), dependency
 cycles, a singleton that would capture a scoped service (also through `Lazy`),
 and project modules discovery could not import or patch. It only reads; it constructs no
 services. To check again later: `validate_autowiring(container)`
@@ -315,6 +316,13 @@ class Invoice:
     def __init__(self, clock: Annotated[IClock, Keyed("utc")]): ...
 ```
 
+An optional keyed dependency is written `Annotated[IClock, Keyed("utc")] = None`,
+`Optional[Annotated[IClock, Keyed("utc")]] = None` (or `... | None`) or
+`Annotated[Optional[IClock], Keyed("utc")] = None`: the keyed service when it is
+registered, otherwise the default. A `Keyed` marker in any other place (a union
+with another type, inside `list[...]`) is not supported; it is never ignored
+silently - a WARNING and a validation issue name the field and the key.
+
 Keyed registrations are used through constructors and `resolve`, not through
 `*_instance` fields. With fields, use *Several implementations of one contract*:
 there the class name works as the key.
@@ -360,6 +368,11 @@ autowiring has started, call `refresh()` before creating new consumers.
 **Why:** you prefer FastAPI's `Depends` for some endpoints.
 **How:** `controller=Depends(injected(ProductController))`, with `injected`
 from `py_autowired.fastapi`. The fields of the object are filled the same way.
+A class that discovery never patched (outside the project root, or created
+after startup) is not changed: `injected()` fills the `None` fields of the
+object it builds after `__init__` returns, so `__init__` itself cannot use them
+yet. Move such a class into the project (or create it after `auto_inject()`'s
+discovery) if `__init__` needs its fields.
 
 ### Logging and debug output
 
@@ -412,6 +425,38 @@ def test_files_skipped_at_startup_are_wired():
     check_skipped()       # raises on any problem
 ```
 
+**The root fix is in the application:** the skip happens because discovery
+starts while the application module is still being imported. Start it after
+that import has finished and nothing is skipped. The bridges already do this
+(`attach_container` in FastAPI's lifespan, Flask and Django at the first
+request). A startup that calls `auto_inject()` itself can do the same; it then
+also gives each request its own scope and closes the container at the end
+(what `attach_container` does for you):
+
+```python
+# app.py - calls auto_inject() itself instead of attach_container()
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from py_autowired import Container, auto_inject
+from register import register
+
+container = Container()
+register(container)
+
+@asynccontextmanager
+async def lifespan(app):
+    auto_inject(container)   # app.py has finished importing: main.py loads normally
+    yield
+    await container.aclose()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.middleware("http")
+async def request_scope(request, call_next):
+    async with container.create_scope():   # scoped services live for one request
+        return await call_next(request)
+```
+
 If such a file finishes loading in another thread while the library is busy,
 its import cannot be failed any more: the problem is an ERROR at once and, with
 `validate=True`, the next library call (`refresh()`, `activate_container()`,
@@ -430,9 +475,14 @@ of its own by `validate_autowiring()`.
   factory is creating waits forever - no lock shows that wait, for singletons
   as for scoped services. It is not silent: a thread that waits at a creation
   gate longer than `container.creation_wait_warning` seconds (10 by default)
-  logs one WARNING naming both threads - at once if it holds no creation lock
-  itself, otherwise when it releases them. The suite runs on the free-threaded
-  CPython 3.14t build.
+  logs one WARNING naming both threads, written at once by a background writer
+  (a log handler never blocks a waiting thread; if many warnings pile up, the
+  oldest are dropped and their number is written). The same applies to a
+  `Lazy` value (two threads reading each other's `Lazy` raise
+  `CircularDependencyError`), to closing a scope while a creation in it is
+  still running, and to the library's own lock (`refresh()`,
+  `activate_container()`, ... waiting while `auto_inject()` imports modules).
+  The suite runs on the free-threaded CPython 3.14t build.
 - **Shutdown of the Flask/Django bridges:** container-created singletons are
   closed at process exit; one that only has `aclose()` is closed in a short
   event loop.
@@ -458,6 +508,24 @@ of its own by `validate_autowiring()`.
 - **Speed:** an injected field costs a few microseconds per object creation on
   warm caches; measure on your machine with
   `python -B benchmarks/field_injection.py --number 100000 --repeat 5`.
+
+## Coming in 0.6.0
+
+These change behaviour that working code may rely on, so in 0.5.4 they are only
+visible (a WARNING or a validation issue); 0.6.0 changes them:
+
+- Equally good candidates become a startup error, with an explicit "first
+  registered" choice for code that wants today's behaviour.
+- A singleton capturing a scoped service becomes an error (`Provider` is the
+  way to use a scoped service from a singleton).
+- Required and optional `*_instance` fields are told apart explicitly.
+- Incomplete discovery (a file that cannot be imported, an unsupported loader)
+  stops startup unless allowed.
+- One construction plan shared by the container and validation, and a startup
+  that imports user code outside the library lock.
+- An explicit policy for properties whose getter fails.
+- A `Keyed` parameter with a default whose type hints cannot be resolved fails
+  instead of using the default.
 
 ## Test quality
 

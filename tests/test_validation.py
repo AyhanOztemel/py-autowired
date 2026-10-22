@@ -249,9 +249,12 @@ def test_factory_hides_constructor_and_abstract_details_from_validation(graph):
 @pytest.mark.parametrize("kind, issue", [
     # 0.5.4: the container fails on these at resolve(); validation no longer passes them.
     ("forward_reference", "Unknown.dependency: type hint cannot be resolved"),
-    ("opaque", "Unknown: constructor signature cannot be read"),
-    # 0.5.4: the container passes arguments by name, so this fails at resolve() too.
-    ("positional_only", "Unknown.dependency is positional-only"),
+    # 0.5.4 (A4): a broken __signature__ is rebuilt from the code, so the real problem shows.
+    ("opaque", "Unknown.dependency needs a type annotation or default"),
+    # Without a code object nothing can be rebuilt: the signature stays unreadable.
+    ("opaque_codeless", "Unknown: constructor signature cannot be read"),
+    # 0.5.4 (A1): positional-only parameters are passed by position.
+    ("positional_only", None),
 ])
 def test_uncertain_constructor_details_are_reported_like_runtime(graph, kind, issue):
     container, patch = graph
@@ -267,6 +270,13 @@ def test_uncertain_constructor_details_are_reported_like_runtime(graph, kind, is
         Unknown.__init__.__annotations__["dependency"] = "UnavailableType"
     elif kind == "opaque":
         Unknown.__init__.__signature__ = object()
+    elif kind == "opaque_codeless":
+        class CodelessInit:
+            __signature__ = object()
+
+            def __call__(self, *args, **kwargs):
+                pytest.fail("validation must not invoke constructors")
+        Unknown.__init__ = CodelessInit()
     elif kind == "positional_only":
         def constructor(self, dependency: Service, /):
             pytest.fail("validation must not invoke constructors")

@@ -167,6 +167,19 @@ class OpaqueService:
     __init__ = _bad_signature_init
 
 
+class _CodelessInit:
+    """An __init__ without a code object: its signature cannot be rebuilt (0.5.4 A4)."""
+
+    __signature__ = "not a signature"
+
+    def __call__(self, *args, **kwargs):
+        pass
+
+
+class CodelessService:
+    __init__ = _CodelessInit()
+
+
 class HintedService:
     def __init__(self, dependency: "NotDefinedAnywhere054"):  # noqa: F821
         self.dependency = dependency
@@ -189,11 +202,11 @@ def _graph_with(service):
 
 
 def test_validation_reports_a_constructor_whose_signature_cannot_be_read(isolated):
-    container = _graph_with(OpaqueService)
-    assert isinstance(_call(container.resolve, OpaqueService), TypeError)       # what runtime does
+    container = _graph_with(CodelessService)
+    assert isinstance(_call(container.resolve, CodelessService), TypeError)     # what runtime does
     error = _call(validate_autowiring, container)
     assert isinstance(error, AutowiringValidationError)
-    assert any("OpaqueService: constructor signature cannot be read" in issue for issue in error.issues)
+    assert any("CodelessService: constructor signature cannot be read" in issue for issue in error.issues)
 
 
 def test_validation_reports_a_type_hint_that_cannot_be_resolved(isolated):
@@ -422,7 +435,7 @@ def test_validation_finishes_finalizers_that_found_the_lock_busy():
 
 
 class OpaqueFieldClass:
-    __init__ = _bad_signature_init
+    __init__ = _CodelessInit()
     clock_instance = None
 
 

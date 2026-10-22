@@ -175,9 +175,20 @@ was simplified) and was run again.
 | 0.5.3 | `_still_importing`, the circular-import branch of the module import | 15 | 15 | 0 |
 | 0.5.4 | skipped-module list, load-time check on every route, `validate=True` output | 50 | 50 | 0 |
 | 0.5.4 | the 15 mutants of 0.5.3 again, on the 0.5.4 code | 15 | 15 | 0 |
-| 0.5.4 | "nothing hides": finalizers, tracking, WARNINGs instead of DEBUG/defaults, validation mirroring the container, first-safe-moment load, `check_skipped`, refresh/activate raising | 76 | 76 | 0 |
-| 0.5.4 | independent blind review (Lazy re-entry, scoped creation gates, deferred warnings, long-wait warning, strict keyed/open generics, bridges, disposal) and the real-application second look (same ready object, read-only properties) | 56 | 56 | 0 |
-| **0.5.4 total** | | **197** | **197** | **0** |
+| 0.5.4 | "nothing hides": finalizers, tracking, WARNINGs instead of DEBUG/defaults, validation mirroring the container, first-safe-moment load, `check_skipped`, refresh/activate raising | 74 | 74 | 0 |
+| 0.5.4 | independent blind review (Lazy re-entry, scoped creation gates, deferred warnings, long-wait warning, strict keyed/open generics, bridges, disposal) and the real-application second look (same ready object, read-only properties) | 51 | 51 | 0 |
+| 0.5.4 | second blind review (background warning writer, Lazy and scope close through the creation gates, library-lock wait warning, late-module checks with `validate=True`, refresh ties, validation through `Lazy`/type variables, cancelled ASGI cleanup, pinned containers) | 39 | 39 | 0 |
+| 0.5.4 | root fixes (positional-only parameters, one type-hint pass, `injected()` filling the built object, rebuilt signatures, deferred annotations on 3.14, optional keyed dependencies, unsupported `Keyed` forms, `validate=True` of a container without weak references) | 61 | 61 | 0 |
+| **0.5.4 total** | | **290** | **290** | **0** |
+
+The last run executed all 290 together on the final code: 285 with Python 3.11
+and the 5 that change code used only on 3.14+ with Python 3.14, three mutants at
+a time, each in its own copy of the repository, with the same 300 s limit per
+mutant as before. Every mutant was killed by a failing assertion; none by the
+time limit (the slowest took 70 s). 12 earlier mutants are no longer run: their
+target code was removed or rewritten (2 in the second review; 5 positional-only
+validation checks and 5 warnings that the root fixes replaced). Their
+successors are among the 61.
 
 Survivors met on the way (all fixed, none equivalent): a validation path that
 skipped a loaded file when the automatic load had run without an active

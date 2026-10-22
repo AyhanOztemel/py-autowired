@@ -211,8 +211,8 @@ auto_inject(container, validate=True)             # console
 ```
 
 Eşleşen kaydı olmayan alanları, eşit derecede uygun adayları, çözülemeyen kurucu
-bağımlılıklarını (okunamayan imza, çözülemeyen tür ipucu ya da yalnız konumsal
-parametre dahil), taramanın import edemediği ya da yamalayamadığı proje modüllerini, bağımlılık döngülerini ve scoped bir servisi tutacak
+bağımlılıklarını (okunamayan ve yeniden kurulamayan imza, çözülemeyen tür ipucu
+ya da desteklenmeyen bir biçimde yazılmış `Keyed` dahil), taramanın import edemediği ya da yamalayamadığı proje modüllerini, bağımlılık döngülerini ve scoped bir servisi tutacak
 singleton'ları listeler. Yalnız okur, hiçbir servis oluşturmaz. Sonradan tekrar
 kontrol için: `validate_autowiring(container)` (`.issues` içeren
 `AutowiringValidationError` fırlatır). Tarama sırasında yüklenemeyen bir dosya
@@ -312,6 +312,14 @@ class Invoice:
     def __init__(self, clock: Annotated[IClock, Keyed("utc")]): ...
 ```
 
+İsteğe bağlı anahtarlı bağımlılık `Annotated[IClock, Keyed("utc")] = None`,
+`Optional[Annotated[IClock, Keyed("utc")]] = None` (ya da `... | None`) veya
+`Annotated[Optional[IClock], Keyed("utc")] = None` diye yazılır: anahtarlı servis
+kayıtlıysa o, değilse varsayılan gelir. `Keyed` işaretinin başka bir yerde
+olduğu biçimler (başka bir tiple birleşim, `list[...]` içi) desteklenmez; ama
+asla sessizce yok sayılmaz - bir WARNING ve bir doğrulama sorunu alanı ve
+anahtarı adıyla yazar.
+
 Anahtarlı kayıtlar `*_instance` alanlarıyla değil, kurucu ve `resolve`
 üzerinden kullanılır. Alanlarla *Bir sözleşmenin birden çok uygulaması*
 yöntemini kullanın: orada anahtarın yerini sınıf adı tutar.
@@ -359,6 +367,11 @@ sonra bir kaydı değiştirirseniz yeni tüketiciler oluşturmadan önce
 **Neden:** bazı uç noktalarda FastAPI'nin `Depends` yapısını tercih ediyorsunuz.
 **Kullanımı:** `controller=Depends(injected(ProductController))`; `injected`
 `py_autowired.fastapi` içinden gelir. Nesnenin alanları aynı şekilde dolar.
+Taramanın hiç yamalamadığı bir sınıf (proje kökü dışında ya da açılıştan sonra
+oluşturulmuş) değiştirilmez: `injected()` kurduğu nesnenin `None` kalan
+alanlarını `__init__` bittikten sonra doldurur; bu yüzden `__init__`'in kendisi
+o alanları henüz kullanamaz. `__init__` alanlarına ihtiyaç duyuyorsa sınıfı
+projeye taşıyın.
 
 ### Log ve hata ayıklama çıktısı
 
@@ -410,6 +423,37 @@ def test_acilista_atlanan_dosyalar_baglanir():
     check_skipped()       # sorun varsa hata fırlatır
 ```
 
+**Kökten çözüm uygulamadadır:** atlama, tarama uygulama modülü henüz import
+edilirken başladığı için olur. Taramayı bu import bittikten sonra başlatırsanız
+hiçbir dosya atlanmaz. Köprüler bunu zaten yapar (FastAPI'de `attach_container`
+lifespan içinde, Flask ve Django ilk istekte). `auto_inject()`'i kendisi çağıran
+bir açılış da aynısını yapabilir; o zaman her isteğe kendi scope'unu da verir ve
+sonda container'ı kapatır (`attach_container`'ın sizin yerinize yaptığı):
+
+```python
+# app.py - attach_container() yerine auto_inject()'i kendisi çağırır
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from py_autowired import Container, auto_inject
+from register import register
+
+container = Container()
+register(container)
+
+@asynccontextmanager
+async def lifespan(app):
+    auto_inject(container)   # app.py import'u bitti: main.py normal yüklenir
+    yield
+    await container.aclose()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.middleware("http")
+async def request_scope(request, call_next):
+    async with container.create_scope():   # scoped servisler bir istek boyunca yaşar
+        return await call_next(request)
+```
+
 Böyle bir dosya, kütüphane meşgulken başka bir thread'de yüklenmeyi bitirirse
 artık o import durdurulamaz: sorun hemen ERROR olur ve `validate=True` ise sonraki
 kütüphane çağrısı (`refresh()`, `activate_container()`, `auto_inject()`,
@@ -428,9 +472,13 @@ bir satırda adıyla bildirir.
   beklerse sonsuza dek bekler - bu beklemeyi hiçbir kilit göstermez; singleton'da
   da scoped'da da aynıdır. Sessiz değildir: bir oluşturma kapısında
   `container.creation_wait_warning` saniyeden (varsayılan 10) uzun bekleyen thread
-  iki thread'i de adlandıran bir WARNING yazar - kendisi oluşturma kilidi
-  tutmuyorsa hemen, tutuyorsa onları bıraktığında. Testler GIL'siz CPython
-  3.14t'de de koşar.
+  iki thread'i de adlandıran bir WARNING yazar; bunu hemen bir arka plan yazıcısı
+  yazar (log işleyicisi bekleyen thread'i asla bloklamaz; uyarılar birikirse en
+  eskiler düşer ve sayısı yazılır). Aynısı `Lazy` değeri (iki thread birbirinin
+  `Lazy`'sini okursa `CircularDependencyError`), içinde oluşturma süren bir
+  scope'un kapatılması ve kütüphanenin kendi kilidi için de geçerlidir
+  (`auto_inject()` modül import ederken bekleyen `refresh()`,
+  `activate_container()` ...). Testler GIL'siz CPython 3.14t'de de koşar.
 - **Flask/Django köprülerinde kapanış:** container'ın oluşturduğu singleton'lar
   süreç çıkışında kapatılır; yalnız `aclose()` olanı kısa bir olay döngüsünde
   kapatılır.
@@ -455,6 +503,24 @@ bir satırda adıyla bildirir.
 - **Hız:** sıcak önbellekte enjekte edilen bir alan, nesne oluşturma başına
   birkaç mikrosaniye ekler; kendi makinenizde ölçmek için
   `python -B benchmarks/field_injection.py --number 100000 --repeat 5`.
+
+## 0.6.0'da gelecek
+
+Bunlar çalışan kodun dayanabileceği davranışı değiştirir; bu yüzden 0.5.4'te
+yalnız görünürdürler (WARNING ya da doğrulama sorunu), 0.6.0'da değişecekler:
+
+- Eşit puanlı adaylar açılış hatası olacak; bugünkü davranışı isteyen kod için
+  açık bir "ilk kayıt" seçimi olacak.
+- Bir singleton'ın scoped servisi yakalaması hata olacak (singleton'dan scoped
+  servis kullanmanın yolu `Provider`).
+- Zorunlu ve isteğe bağlı `*_instance` alanları açıkça ayrılacak.
+- Eksik tarama (import edilemeyen dosya, desteklenmeyen yükleyici), izin
+  verilmedikçe açılışı durduracak.
+- Container ile doğrulamanın ortak kullandığı tek bir oluşturma planı ve
+  kullanıcı kodunu kütüphane kilidinin dışında import eden bir açılış.
+- Getter'ı hata veren property'ler için açık bir kural.
+- Tür ipuçları çözülemediğinde varsayılanı olan `Keyed` parametre, varsayılanı
+  almak yerine hata verecek.
 
 ## Test kalitesi
 

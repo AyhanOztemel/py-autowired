@@ -677,6 +677,11 @@ def test_a_real_import_failure_found_later_is_a_warning_once(make_project, caplo
     with caplog.at_level(logging.DEBUG, logger="py_autowired"):
         _first_injection(tag)
         _first_injection(tag)
+        # Written by the background writer (this may run inside a resolution).
+        deadline = time.monotonic() + 3
+        while not _records(caplog, logging.WARNING, f"Import failed for main_{tag}") and time.monotonic() < deadline:
+            time.sleep(0.02)
+        time.sleep(0.2)                                     # room for a wrong second line
     assert len(_records(caplog, logging.WARNING, f"Import failed for main_{tag}", "does_not_exist_pkg_0541")) == 1
 
 

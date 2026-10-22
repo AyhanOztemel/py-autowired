@@ -133,9 +133,20 @@ class AsgiRequestScope:
                 except RuntimeError:  # not asyncio (e.g. trio): no shield available here
                     await closing
                 else:
-                    # A cancelled request must still close its scoped services. Only
-                    # the closing runs shielded; the scope is left in this context.
-                    await asyncio.shield(closing)
+                    # A cancelled request must still close its scoped services, and
+                    # their errors must reach the caller: wait for the shielded
+                    # closing through every cancellation, then report. Only the
+                    # closing runs in the task; the scope is left in this context.
+                    task = asyncio.ensure_future(closing)
+                    cancelled = None
+                    while not task.done():
+                        try:
+                            await asyncio.shield(task)
+                        except asyncio.CancelledError as error:
+                            cancelled = error
+                    task.result()  # a cleanup error wins over the cancellation
+                    if cancelled is not None:
+                        raise cancelled
             finally:
                 request_scope._leave()
 

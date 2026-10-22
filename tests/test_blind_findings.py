@@ -298,7 +298,7 @@ def test_n1_a_plural_field_in_the_class_body_is_a_list(graph):
     assert isinstance(value, list) and [type(item) for item in value] == [RepoN1A, RepoN1B]
 
 
-# ---- N2: validation reports a positional-only parameter the container would pass by name ---
+# ---- N2: a positional-only parameter is passed by position (0.5.4 A1; was a validation issue) ---
 
 class _ServiceN2:
     pass
@@ -309,16 +309,14 @@ class _PositionalN2:
         self.dependency = dependency
 
 
-def test_n2_a_positional_only_dependency_is_a_validation_issue(graph):
+def test_n2_a_positional_only_dependency_is_injected(graph):
     container, patch = graph
     container.register_transient(_ServiceN2)
     container.register_transient(_PositionalN2)
-    consumer = type("ConsumerN2", (), {"__module__": __name__, "_positionaln2_instance": None})
     consumer = type("ConsumerN2", (), {"__module__": __name__, "positionaln2_instance": None})
     patch(consumer)
-    with pytest.raises(TypeError):
-        container.resolve(_PositionalN2)                                  # what the container does
-    assert any("_PositionalN2.dependency is positional-only" in issue for issue in _issues(container))
+    assert isinstance(container.resolve(_PositionalN2).dependency, _ServiceN2)
+    assert _issues(container) == ()
 
 
 # ---- N3: a singleton holding Lazy[Scoped] keeps the first scope's object -------------------
@@ -930,7 +928,7 @@ class _ProvidedN2:
         self.dependency = dependency
 
 
-def test_n2_positional_only_with_provider_or_keyed_is_reported(graph):
+def test_n2_positional_only_with_provider_or_keyed_is_injected(graph):
     from typing import Annotated
     from py_autowired import Keyed
     container, patch = graph
@@ -943,15 +941,12 @@ def test_n2_positional_only_with_provider_or_keyed_is_reported(graph):
     container.register_keyed(_KeyN2, "k", _KeyN2)
     container.register_transient(_ProvidedN2)
     container.register_transient(KeyedPositional)
-    consumer = type("ConsumerN2b", (), {"__module__": __name__, "providedn2_instance": None,
-                                        "keyedpositional_instance": None})
-    consumer = type("ConsumerN2b", (), {"__module__": __name__, "_providedn2_instance": None})
     consumer = type("ConsumerN2b", (), {"__module__": __name__, "keyedpositional_instance": None,
                                         "providedn2_instance": None})
     patch(consumer)
-    issues = _issues(container)
-    assert any("_ProvidedN2.dependency is positional-only" in issue for issue in issues)
-    assert any("KeyedPositional.dependency is positional-only" in issue for issue in issues)
+    assert _issues(container) == ()
+    assert isinstance(container.resolve(_ProvidedN2).dependency(), _ServiceN2)
+    assert isinstance(container.resolve(KeyedPositional).dependency, _KeyN2)
 
 
 class _TransientLazyN3:

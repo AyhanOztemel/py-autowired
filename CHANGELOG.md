@@ -37,9 +37,10 @@ line or a quiet default. Nothing is removed; what gets injected does not change.
 - An independent blind review found more silent paths; each is now visible or
   fixed (each pinned by a test that failed before the change):
   - validation reports a singleton holding `Lazy[Scoped]` (Lazy keeps the first
-    value), a keyed singleton capturing a scoped field, a positional-only
-    constructor parameter (the container passes arguments by name), and every
-    project module discovery could not import or a late import could not patch;
+    value), a keyed singleton capturing a scoped field, and every project module
+    discovery could not import or a late import could not patch (a
+    positional-only constructor parameter, first reported here, is now supported
+    - see "Root fixes" below);
   - a scoped service resolved while a singleton is being created is a WARNING
     (once per pair; behaviour unchanged). All warnings raised during resolution
     are written after every creation lock is released - a log handler may take
@@ -58,13 +59,47 @@ line or a quiet default. Nothing is removed; what gets injected does not change.
 - `refresh()`, `activate_container()` and `auto_inject()` raise a
   `validate=True` failure of a file that finished loading in another thread
   while the library was busy - after finishing their own work.
-- Validation no longer passes what the container would fail on: an unreadable
-  constructor signature and a type hint that cannot be resolved (without a
-  default) are now issues. A non-callable `__init__` fails as Python makes it
-  fail (the patched constructor used to swallow it).
+- Validation no longer passes what the container would fail on: a constructor
+  signature that cannot be read (and cannot be rebuilt, see "Root fixes") and a
+  type hint that cannot be resolved (without a default) are now issues. A
+  non-callable `__init__` fails as Python makes it fail (the patched
+  constructor used to swallow it).
 
 ### Fixed
 
+- A second independent blind review found more paths that could hang or stay
+  silent; each is fixed or made visible (each pinned by a test that failed
+  before the change):
+  - two threads reading each other's `Lazy` values hung; `Lazy` now uses the
+    same creation gates as singletons and scoped services (cycle check, long
+    wait warning);
+  - closing a scope waited for an in-flight creation without any check, and a
+    long-wait warning of a thread holding locks waited behind the very hang it
+    reported: waits go through the wait-for graph and warnings are written by a
+    single background writer (bounded queue; dropped warnings are counted);
+  - a thread waiting for the library lock (for example `refresh()` while
+    `auto_inject()` imports a module that waits for that thread) now reports it
+    after `_GLOBAL_WAIT_WARNING` seconds (10);
+  - an import queued while the library was busy is a WARNING (objects created
+    before its classes are patched get no injection);
+  - with `validate=True`, every project module imported after startup is
+    checked when it loads (an import with a wiring problem fails), and a
+    skipped file whose later import fails raises at the first safe moment;
+  - `refresh()` reports ties created by new registrations (once per new set);
+  - validation follows what a `Lazy` builds (a singleton holding
+    `Lazy[Transient]` whose transient needs a scoped service is a capture),
+    substitutes generic type variables as the container does, and finds
+    `Provider`/`Lazy` of a closed open-generic;
+  - an assignment `obj.x_instance = None` with no registration warns like
+    construction does; import failures keep their traceback; a disposal note
+    that neither the exception nor the log can take goes to stderr; a failed
+    check of a skipped module stays a validation issue (`fastapi.injected()` of
+    a never-patched class and a lost Keyed metadata pass, first made visible
+    here, are now fixed at the root - see "Root fixes" below);
+  - a Django ASGI request cancelled again while its scope closes still waits
+    for the closing and passes its error to the caller;
+  - a container that cannot be weakly referenced is kept alive while the
+    library holds entries for it, so its id is never reused.
 - Two registrations of the same ready object (`register_instance(A, obj)` and
   `register_instance(B, obj)`) were reported as "equally good candidates"
   (startup WARNING and `validate=True`): every candidate gives the field that
@@ -105,6 +140,107 @@ line or a quiet default. Nothing is removed; what gets injected does not change.
   drain of the queue (a later import, `refresh()`, `activate_container()` or
   `auto_inject()`) - which might never come. It is now patched as soon as the
   lock is free.
+
+### Root fixes
+
+Some problems above were first only made visible. These are now fixed where
+they start (none of them breaks working code: each one used to fail, or to
+inject the wrong thing or nothing):
+
+- Positional-only constructor parameters (`def __init__(self, repo: Repo, /)`)
+  are supported: the container passes them by position (a skipped one gets its
+  own default). They used to fail with `TypeError`.
+- Type hints are read once, with their metadata: a `Keyed` parameter can no
+  longer fall back to the unkeyed registration when the metadata pass fails
+  while the plain one succeeds (it fails like any unresolvable hint). A
+  constructor without `Annotated` hints reads them once instead of twice.
+- `fastapi.injected()` of a class that discovery never patched (outside the
+  project root, or created after startup) fills the `None` fields of the object
+  it builds, after `__init__` returns. The class itself is not changed (modules
+  outside the project are never touched), so `__init__` cannot use those fields
+  yet. A field with no registration is a WARNING, as everywhere.
+- A `__signature__` that cannot be read is rebuilt from the function's code
+  (`functools.wraps` wrappers included): the container passes the right
+  arguments, and validation checks the real parameters - also of a
+  field-injection class. Only a callable without code (a callable object used
+  as `__init__`) stays "cannot be read". One WARNING per class says the
+  signature was rebuilt.
+- With deferred annotations (Python 3.14+), a constructor annotation naming
+  something not defined yet broke `inspect.signature` itself: the container,
+  validation and class patching raised a raw `NameError`. The signature is now
+  read with string annotations in that case, and the hint is reported the
+  usual way (validation issue; a default is used, a parameter without one fails
+  to resolve). 3.10-3.13 are unchanged.
+- An optional keyed dependency is injected: `Annotated[T, Keyed(k)] = None` on
+  Python 3.10 (its implicit `Optional` hid the marker), and on every version
+  `Optional[Annotated[T, Keyed(k)]]`, `Union[..., None]`, `... | None` and
+  `Annotated[Optional[T], Keyed(k)]`. They all got `None` while the keyed
+  service was registered. A `Keyed` marker in any other form (a union with
+  another type, inside `list[...]` or `Callable[...]`) is never ignored
+  silently: one WARNING per parameter at runtime and a validation issue, both
+  naming the field and the key.
+- `auto_inject(container, validate=True)` with a container that cannot be
+  weakly referenced lost the `validate=True` setting silently: modules imported
+  after startup were not checked. The setting is now kept (the container is
+  kept alive, as for the other per-container records, so its id is never
+  reused).
+- When type hints cannot be resolved and a parameter with a default has a
+  `Keyed` hint, a WARNING names that field and its key: the default is used even
+  if the keyed service is registered (fixing this would break code that relies
+  on the default: 0.6.0).
+
+### Behaviour changes (tests that changed with them)
+
+Each changed test pinned a defect, not a contract:
+
+- `test_n2_a_positional_only_dependency_is_injected` (was
+  `..._is_a_validation_issue`): a positional-only dependency failed with
+  `TypeError`, validation reported it -> it is injected, validation is clean.
+  Code that worked keeps working.
+- `test_n2_positional_only_with_provider_or_keyed_is_injected` (was
+  `..._is_reported`): the same for `Provider[...]` and `Keyed` parameters.
+- `test_uncertain_constructor_details_are_reported_like_runtime[opaque]`: a
+  broken `__signature__` was "cannot be read" -> it is rebuilt and the real
+  problem (a parameter without annotation or default) is reported. A new case
+  `opaque_codeless` keeps the "cannot be read" path.
+- `test_uncertain_constructor_details_are_reported_like_runtime[positional_only]`:
+  was an issue -> passes (supported).
+- `test_validation_reports_a_constructor_whose_signature_cannot_be_read` and
+  `test_an_unreadable_signature_of_a_field_injection_class_is_a_warning_not_an_issue`:
+  their constructor is now a callable without code (the only one whose
+  signature still cannot be read); the plain function they used is rebuilt now.
+- `test_y11_injected_names_a_field_it_cannot_fill` (was
+  `..._with_an_unpatched_class_is_a_warning`): the fields of a never-patched
+  class stayed `None` -> they are filled on the built object; the class is not
+  patched; an unregistered field is still named in a WARNING.
+- `test_y16_a_failed_metadata_pass_is_reported_as_a_hint_failure` (was
+  `..._lost_keyed_metadata_is_a_warning`): a failed metadata pass made Keyed
+  parameters unkeyed -> it is a type-hint failure like any other (one WARNING),
+  never an unkeyed fallback.
+- `test_a_real_import_failure_found_later_is_a_warning_once`: the WARNING came
+  at once -> the background writer writes it a moment later (still exactly
+  once); the test waits for it.
+
+Tests of 0.5.3 that the earlier 0.5.4 changes above also changed: the skip
+message now ends with "it is checked when it loads"; a read-only property is
+not a field (no getter warning, no validation issue); validation reports an
+unreadable signature and an unresolvable hint; the bridges' exit hook is the
+internal `_release_singletons_at_exit`.
+
+### Coming in 0.6.0 (they change behaviour working code may rely on)
+
+- Equally good candidates become a startup error, with an explicit "first
+  registered" choice for code that wants today's behaviour.
+- A singleton capturing a scoped service becomes an error (`Provider` is the
+  way to use a scoped service from a singleton).
+- Required and optional `*_instance` fields are told apart explicitly.
+- Incomplete discovery (a file that cannot be imported, an unsupported loader)
+  stops startup unless allowed.
+- One construction plan shared by the container and validation, and a startup
+  that imports user code outside the library lock.
+- An explicit policy for properties whose getter fails.
+- A `Keyed` parameter with a default whose type hints cannot be resolved fails
+  instead of using the default.
 
 ## 0.5.3 - 2026-10-21
 
