@@ -583,6 +583,8 @@ def test_n13_asgi_cleanup_survives_cancellation():
 
     wrapped = AsgiRequestScope(application, container, _Ready())
 
+    autowired.activate_container(container)  # what the real startup does
+
     async def main():
         task = asyncio.ensure_future(wrapped({"type": "http"}, None, None))
         await asyncio.sleep(0.03)                 # the request ended; cleanup is awaiting aclose
@@ -832,6 +834,8 @@ def test_n13_the_request_leaves_its_scope():
             pass
 
     wrapped = AsgiRequestScope(application, container, _Ready())
+
+    autowired.activate_container(container)  # what the real startup does
 
     async def main():
         await wrapped({"type": "http"}, None, None)

@@ -16,7 +16,9 @@ from anyio import CancelScope
 from fastapi import FastAPI, Request
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .autowired import _find_project_root, _inject_unpatched, activate_container, auto_inject
+from .autowired import (
+    _check_active, _find_project_root, _inject_unpatched, activate_container, auto_inject,
+)
 from .container import Container
 
 
@@ -33,6 +35,7 @@ class _RequestScopeMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        _check_active(self.container)  # before anything of this request is built
         # Pure ASGI keeps the scope alive through streaming and background work,
         # and awaits both synchronous and asynchronous resource finalizers.
         request_scope = self.container.create_scope()
@@ -113,11 +116,15 @@ def injected(service_type: type[T]) -> Callable[[Request], Coroutine[Any, Any, T
     field injection. A class discovery never patched (outside the project root,
     or created after startup) is not changed: the None fields of the object built
     here are filled after its ``__init__`` returns, so ``__init__`` itself cannot
-    use them yet. Dependencies are async so resolution stays in the request
-    context even when the endpoint itself is synchronous.
+    use them yet. If another application's container is the active one, it
+    raises ``DependencyInjectionError`` before building anything (one container
+    per process; a best-effort catch, not a guarantee). Dependencies are async so
+    resolution stays in the request context even when the endpoint itself is
+    synchronous.
     """
     async def dependency(request: Request) -> T:
         container: Container = request.app.state.py_autowired_container
+        _check_active(container)  # before resolving or building anything
         if container.is_registered(service_type):
             return container.resolve(service_type)
         instance = service_type()

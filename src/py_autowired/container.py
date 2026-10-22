@@ -77,9 +77,15 @@ class _BackgroundLog:
             message, args, exc_info = self._queue.get()
             with self._count:
                 dropped, self._dropped = self._dropped, 0
-            if dropped:
-                logger.warning("%d py_autowired warnings were dropped (the warning queue was full)", dropped)
-            logger.warning(message, *args, exc_info=exc_info)
+            lines = [("%d py_autowired warnings were dropped (the warning queue was full)", (dropped,), None)]
+            for text, values, info in (lines if dropped else []) + [(message, args, exc_info)]:
+                try:
+                    logger.warning(text, *values, exc_info=info)
+                except Exception:  # a failing log handler must never stop the writer
+                    try:
+                        sys.stderr.write("py_autowired: " + (text % values) + "\n")
+                    except Exception:
+                        pass  # stderr is gone too: nothing is left to write to
 
 
 _BACKGROUND_LOG = _BackgroundLog()
@@ -705,7 +711,15 @@ class _ScopeState:
             self.closed = True
         for gate in gates:
             # Through the wait-for graph: a lock cycle raises, a hidden wait is reported.
-            self.container._acquire_creation(gate)
+            try:
+                self.container._acquire_creation(gate)
+            except BaseException:
+                # This thread holds a lock that creation waits for: closing now would run
+                # finalizers under it. Nothing is closed - the scope stays open and whole
+                # (the creation finishes into it); close it again without that lock.
+                with self.lock:
+                    self.closed = False
+                raise
             self.container._release_creation(gate)
         with self.lock:
             return list(self.creation_order)
@@ -777,6 +791,9 @@ class Container:
         self._implementation_selectors: Dict[Type[Any], Callable[[], Type[Any]]] = {}
         self.registration_history: list[tuple[str, Type[Any]]] = []
         self._registration_lock = threading.RLock()
+        # Counts changes of the registrations: the active name map rebuilds itself when
+        # it differs (a replace() after startup reaches new consumers without refresh()).
+        self._changes = 0
         # Opt-in shutdown (close/aclose): container-created singletons in
         # creation order. Appended inside the existing per-registration lock;
         # no new lock on the resolution path.
@@ -964,9 +981,15 @@ class Container:
                 )
             if policy == "replace":
                 self._earlier.pop(service_type, None)
+                # An alias shares a registration of the replaced type: it moves along
+                # (a test replacing a service must not leave the old one behind an alias).
+                for key, previous in list(self.registrations.items()):
+                    if previous.service_type is service_type:  # the type itself is set just below
+                        self.registrations[key] = registration
             elif exists:
                 self._keep_earlier(self.registrations[service_type], registration)
             self.registrations[service_type] = registration
+            self._changes += 1
             self.registration_history.append((policy, service_type))
             return True
 
@@ -1090,6 +1113,7 @@ class Container:
                     f"Service is already registered: {alias_type.__name__}"
                 )
             self.registrations[alias_type] = registration
+            self._changes += 1
             self.registration_history.append(("alias", alias_type))
 
     def register_factory(
@@ -1372,6 +1396,9 @@ class Container:
         registration.lock.release()
 
     def _resolve_registration(self, registration: ServiceRegistration) -> Any:
+        if (registration.instance is not _UNSET and registration.scope is LifetimeScope.SINGLETON
+                and not self._closed):
+            return registration.instance  # a ready singleton: no lock taken, nothing to warn about
         _RESOLVING.depth = getattr(_RESOLVING, "depth", 0) + 1
         try:
             return self._resolve_registration_now(registration)

@@ -317,7 +317,7 @@ class _CachedNameMap:
     Internal cache for name map and resolutions.
     Provides massive speedup while maintaining backward compatibility.
     """
-    __slots__ = ('_raw_map', '_resolution_cache', '_container', '_lock', '_generation')
+    __slots__ = ('_raw_map', '_resolution_cache', '_container', '_lock', '_generation', '_seen')
 
     def __init__(self, container):
         self._container = container
@@ -325,32 +325,47 @@ class _CachedNameMap:
         self._resolution_cache: Dict[Tuple[str, str], Any] = {}
         # 🆕 v2: nogil güvenliği — lazy init yarışını kapatan kilit
         self._lock = threading.Lock()
-        # Bumped by refresh(); lets lock-free lookups detect a concurrent refresh.
+        # Bumped by every rebuild; lets lock-free lookups detect a concurrent one.
         self._generation = 0
+        # The container's change count the map was built from (None: not built yet).
+        self._seen = None
+
+    def _stale(self) -> bool:
+        return self._raw_map is None or getattr(self._container, "_changes", 0) != self._seen
 
     def get_raw_map(self) -> dict:
-        """Get raw name map - built once, reused (🆕 v2: thread-safe)"""
-        # Double-checked locking: sıcak yolda kilitsiz okuma
-        if self._raw_map is None:
+        """The name map: built once, and again when the registrations have changed."""
+        # Double-checked locking: no lock on the hot path
+        if self._stale():
             with self._lock:
-                if self._raw_map is None:
-                    self._raw_map = _build_name_map_from_container(self._container)
+                if self._stale():
+                    self._rebuild()
         return self._raw_map
+
+    def _rebuild(self):
+        """Build the map and drop the cached choices (the caller holds self._lock)."""
+        seen = getattr(self._container, "_changes", 0)  # read first: a change meanwhile rebuilds again
+        self._generation += 1  # first: a lookup storing an old choice from now on drops it
+        self._raw_map = _build_name_map_from_container(self._container)
+        self._resolution_cache.clear()
+        self._seen = seen
 
     def refresh(self):
         """🆕 v2: Geç kayıtlar için haritayı ve cache'i yeniden kur."""
         with self._lock:
-            self._raw_map = _build_name_map_from_container(self._container)
-            self._resolution_cache.clear()
-            self._generation += 1
+            self._rebuild()
 
     def get_cached_registration(self, normalized_name: str, context_module: str) -> Optional[Any]:
         """Get best registration with aggressive caching"""
+        if getattr(self._container, "_changes", 0) != self._seen:
+            self.get_raw_map()  # the registrations changed: never answer from the old choices
         cache_key = (normalized_name, context_module)
 
-        # O(1) cache lookup (lock-free hot path, as in 0.4.0)
-        if cache_key in self._resolution_cache:
-            return self._resolution_cache[cache_key]
+        # O(1) cache lookup (lock-free hot path, as in 0.4.0), read once: a rebuild may
+        # clear the choices at any moment
+        cached = self._resolution_cache.get(cache_key, _UNSET)
+        if cached is not _UNSET:
+            return cached
 
         # Cache miss - calculate and store (still lock-free). The generation is
         # read BEFORE the map, so a refresh() during the computation is detected.
@@ -650,8 +665,10 @@ def _inject_fields(self, cls, container, name_map, di_candidates) -> None:
 
         if not reg:
             _warn_once(("unregistered", cls.__module__, cls.__qualname__, attr),
-                       "%s.%s.%s: no matching registration; the field stays None",
-                       cls.__module__, cls.__qualname__, attr)
+                       "%s.%s.%s: no matching registration; the field stays None%s",
+                       cls.__module__, cls.__qualname__, attr,
+                       "" if _NAME_MAP_CACHE is not None else
+                       " (no container is active: the application's startup has not run)")
             continue
 
         try:
@@ -1184,7 +1201,12 @@ _VALIDATING_PINNED: Dict[int, Any] = {}
 
 
 def _is_validating(container) -> bool:
-    return container in _VALIDATING or id(container) in _VALIDATING_PINNED
+    if id(container) in _VALIDATING_PINNED:
+        return True
+    try:
+        return container in _VALIDATING
+    except TypeError:  # an unhashable container: it is in _VALIDATING_PINNED if validating
+        return False
 
 
 def _patch_late_module(module) -> None:
@@ -1442,9 +1464,11 @@ _INJECTED_FIELDS = weakref.WeakKeyDictionary()  # class -> its *_instance fields
 def _inject_unpatched(instance, container) -> None:
     """injected() built an object of a class discovery never patched (outside the
     project root, or created after startup): fill the None fields of that ONE
-    object. The class is not changed - modules outside the project are never
-    touched - so a field used inside __init__ right after ``= None`` is not
-    filled yet there."""
+    object, the way a patched __init__ does. The class is not changed - modules
+    outside the project are never touched - so a field used inside __init__ right
+    after ``= None`` is not filled yet there. The caller checked that no other
+    container is the active one (_check_active); with none active (startup has not
+    run) a field that is not found stays None with a WARNING naming it, as in 0.5.3."""
     cls = type(instance)
     if cls.__dict__.get("__ai_ioc_init__", False):
         return  # its patched __init__ has filled it
@@ -1452,8 +1476,23 @@ def _inject_unpatched(instance, container) -> None:
         candidates = _INJECTED_FIELDS[cls]
     except KeyError:
         candidates = _INJECTED_FIELDS[cls] = _find_di_candidates(cls)
-    name_map = {} if _NAME_MAP_CACHE is not None else _build_name_map_from_container(container)
-    _inject_fields(instance, cls, container, name_map, candidates)
+    _inject_fields(instance, cls, container, {}, candidates)
+
+
+def _check_active(container) -> None:
+    """A request of ``container``'s application (web bridges, injected()): if another
+    container is the active one, fail before anything is built - patched classes would
+    be filled from it. A best-effort catch, not a guarantee: one container per process
+    is supported (several applications in one process: 0.6.0). No active container at
+    all (startup has not run) is 0.5.3's behaviour."""
+    cache = _NAME_MAP_CACHE
+    if cache is not None and cache._container is not container:
+        raise DependencyInjectionError(
+            "This request's container is not the active one: another application's container "
+            "was activated in this process. py_autowired supports one container per process: "
+            "run each application in its own process; in tests, open each application with "
+            "`with TestClient(app)` (its startup makes its container the active one) or call "
+            "activate_container(container)")
 
 
 def _warn_equal_candidates(container, name_map) -> None:

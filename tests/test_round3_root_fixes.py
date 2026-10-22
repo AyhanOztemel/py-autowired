@@ -12,7 +12,7 @@ from typing import Annotated
 
 import pytest
 
-from typing import Callable, Optional, Union, get_type_hints
+from typing import Callable, Optional, Union, get_args, get_type_hints
 
 from py_autowired import (
     AutowiringValidationError,
@@ -260,11 +260,11 @@ def test_a3_injected_fills_the_fields_of_an_unpatched_class(graph, monkeypatch):
     assert maps == []                                         # the active cache is used
 
 
-def test_a3_without_an_active_cache_the_container_s_own_names_are_used(monkeypatch):
+def test_a3_without_an_active_container_the_field_stays_none_with_a_warning(monkeypatch, caplog):
     pytest.importorskip("fastapi")
     from py_autowired.fastapi import injected
 
-    monkeypatch.setattr(autowired, "_NAME_MAP_CACHE", None)
+    monkeypatch.setattr(autowired, "_NAME_MAP_CACHE", None)  # the application's startup has not run
     container = Container()
     container.register_singleton(_ClockA3)
 
@@ -272,7 +272,11 @@ def test_a3_without_an_active_cache_the_container_s_own_names_are_used(monkeypat
         def __init__(self):
             self.clocka3_instance = None
 
-    assert isinstance(asyncio.run(injected(NoCacheA3)(_request_for(container))).clocka3_instance, _ClockA3)
+    with caplog.at_level(logging.DEBUG, logger="py_autowired"):
+        made = asyncio.run(injected(NoCacheA3)(_request_for(container)))
+    assert made.clocka3_instance is None                     # as in 0.5.3
+    assert autowired._NAME_MAP_CACHE is None                 # nothing was made active
+    assert _warnings(caplog, "NoCacheA3.clocka3_instance", "startup has not run")
 
 
 def test_a3_a_patched_class_is_not_scanned_again(graph, monkeypatch):
@@ -511,6 +515,22 @@ def test_a4_a_callable_without_code_stays_unknown(caplog):
     assert container_module._accepts_no_arguments(_CodelessA4) is True
 
 
+def test_k7_a_lifetime_only_follow_never_reports_an_unreadable_signature(graph):
+    """Through Lazy only lifetime problems are followed: an unreadable signature is not one."""
+    container, patch = graph
+    container.register_transient(_CodelessA4)
+    holder = type("LazyCodelessHolder", (), {"__module__": __name__})
+
+    def __init__(self, inner: Lazy[_CodelessA4]):
+        self.inner = inner
+
+    holder.__init__ = __init__
+    container.register_singleton(holder)
+    patch(_consumer("lazycodelessholder_instance"))
+    issues = getattr(_call(validate_autowiring, container), "issues", ())
+    assert [issue for issue in issues if "cannot be read" in issue] == []
+
+
 def test_a4_an_ordinary_signature_is_python_s_own():
     """Guard: the helper returns exactly what inspect.signature returns."""
     assert container_module._init_signature(_PositionalA1) == inspect.signature(_PositionalA1.__init__)
@@ -626,6 +646,22 @@ def test_a8_an_optional_keyed_dependency_without_a_registration_keeps_its_defaul
     container = Container()
     container.register_transient(cls)
     assert container.resolve(cls).a is None
+
+
+class _DepPipeA8:  # its own class: typing's cache must not hand back an equal Optional[...] form
+    pass
+
+
+def test_a8_a_pipe_union_inside_annotated_is_unwrapped():
+    annotation = Annotated[_DepPipeA8 | None, Keyed("pipe")]
+    inner = get_args(annotation)[0]
+    if sys.version_info < (3, 14):                            # this test is about types.UnionType
+        assert type(inner) is types.UnionType, f"not the types.UnionType form: {type(inner)!r}"
+    cls = _class_with(annotation, name="PipeA8")
+    container = Container()
+    container.register_keyed(_DepPipeA8, "pipe", _DepPipeA8)
+    container.register_transient(cls)
+    assert isinstance(container.resolve(cls).a, _DepPipeA8), "the keyed registration was ignored"
 
 
 def test_a8_validation_follows_an_optional_keyed_dependency(graph):

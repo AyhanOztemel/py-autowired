@@ -117,6 +117,7 @@ def _startup_counting(monkeypatch):
     calls = []
     monkeypatch.setattr(_web, "auto_inject", lambda *a, **k: calls.append(1))
     monkeypatch.setattr(_web, "activate_container", lambda c: None)
+    monkeypatch.setattr(autowired, "_NAME_MAP_CACHE", None)  # so no container is active
     return calls
 
 

@@ -2,8 +2,12 @@
 
 ## 0.5.4 - 2026-10-21
 
-Nothing hides any more: no problem stays behind a `try/except`, a DEBUG-only
-line or a quiet default. Nothing is removed; what gets injected does not change.
+No problem stays silently behind a `try/except`, a DEBUG-only line or a quiet
+default any more: each one is a WARNING, an ERROR or a validation issue - shown
+when the application configures `logging`; validation covers the graph the
+`*_instance` fields reach. Many are made visible rather than prevented (see
+"Known limits" in the README); "Coming in 0.6.0" lists those that will become
+errors. Nothing is removed; what gets injected does not change.
 
 ### Added
 
@@ -189,6 +193,69 @@ inject the wrong thing or nothing):
   if the keyed service is registered (fixing this would break code that relies
   on the default: 0.6.0).
 
+### Third review
+
+A last blind review of the changes above found four more; each is fixed and
+pinned by a test that failed before:
+
+- A log handler that raised stopped the background warning writer for good:
+  later warnings were never written. The writer now survives a failing handler
+  and writes that warning to stderr instead.
+- A container that cannot be hashed (`__eq__` without `__hash__`) broke every
+  project module imported after startup with a `TypeError`.
+- A lock cycle found while closing a scope (the closing thread holds a lock
+  that a creation in that scope waits for) left the scope closed but its
+  objects open, and a second `close()` did nothing. Now nothing is closed
+  while that lock is held: the scope stays open and whole (the creation
+  finishes into it), the `CircularDependencyError` is raised, and closing it
+  again without the lock closes every object - also those that can only be
+  closed with `aclose()`.
+- Two web applications in one process could serve one application's requests
+  with the other application's services: patched classes, `injected()` and the
+  field dependencies of registered services all use the active container, which
+  is the one started last. Several applications in one process are not
+  supported (that comes in 0.6.0, with a per-request container); 0.5.4 adds one
+  simple check that catches the usual case: a request (FastAPI, Flask, Django)
+  or an `injected()` call whose container is not the active one fails with
+  `DependencyInjectionError` before anything is built. It is a best-effort
+  catch, not a guarantee: it is made at the start of the request, so a
+  container activated while the request runs, or an object built outside any
+  request, is not caught. Applications used one after another, as in tests,
+  keep working: each startup makes its own container the active one, and a
+  stopped application's container stays active until then, so a patched class
+  never falls back to an older container. Applications sharing one container
+  (for example a mounted sub-application) are not affected. `injected()` fills
+  a never-patched class through the same path as a patched `__init__`; with no
+  active container at all (no application has started yet, as with only
+  `TestClient`s used without `with`) nothing changes from 0.5.3: a field that is
+  not found stays `None`, and its WARNING now says that startup has not run.
+  Mixing the two is caught: after an application opened with `with` has
+  stopped, its container stays active, so a request of another application used
+  without `with` fails - open every application with `with`, or call
+  `activate_container(container)` first.
+- A registration changed after autowiring started (`replace()`, a later
+  `register()` or `register_alias()`) did not reach new consumers until
+  `refresh()` was called: `resolve()` already gave the new implementation while
+  a patched class's field silently still got the old one (since 0.5.3). The
+  active name map now rebuilds itself when the registrations change; an
+  unchanged container never rebuilds it, and the lookup takes no lock.
+- `replace()` moves the aliases of the replaced type along (also a chain of
+  aliases, and an alias of an earlier registration of that type). An alias
+  used to keep the old registration, so a test that replaced a service with a
+  fake still got the real one through the alias. Replacing the alias itself
+  still leaves its target alone; `register()` still leaves an alias where it was.
+- Speed: creating an object whose fields are injected was about 50% slower than
+  in 0.5.3 during the 0.5.4 work. Almost all of it came from one step: every
+  `resolve()` got per-call bookkeeping for deferred warnings, and an already
+  created singleton paid for it too, although it takes no lock and has nothing
+  to warn about. A ready singleton now returns at once (a closed container
+  still raises). Measured with the same benchmark (one injected field,
+  200 000 objects, 10 alternating rounds, CPython 3.11; median of the per-round
+  differences): -0.9% against 0.5.3 (no slowdown left), -31.5% against the
+  previous 0.5.4 step. The slowdown was missed because each step was only
+  compared with the step before it (each stayed under the 5% limit, one step
+  added 45%); the release is now also measured against the previous release.
+
 ### Behaviour changes (tests that changed with them)
 
 Each changed test pinned a defect, not a contract:
@@ -217,6 +284,31 @@ Each changed test pinned a defect, not a contract:
   `..._lost_keyed_metadata_is_a_warning`): a failed metadata pass made Keyed
   parameters unkeyed -> it is a type-hint failure like any other (one WARNING),
   never an unkeyed fallback.
+- (no test changed) `replace()` with an alias: the alias kept the replaced
+  registration -> it follows the replacement. This was listed as a known
+  limitation; it is a defect, not a contract: `replace()` exists to put a fake
+  in place of a service, and an alias silently bypassed it.
+- (new tests) Two web applications running at the same time: one
+  application's requests were served with the other's services, silently ->
+  the request fails before anything is built (FastAPI, Flask, Django). This is
+  the documented "one container per process" made explicit, not a new limit,
+  and a best-effort catch, not a guarantee. The error names the fix for tests
+  that use several applications one after another: open each with
+  `with TestClient(app):` (its startup makes its container the active one) or
+  call `activate_container(container)`:
+
+  ```python
+  def test_first():
+      with TestClient(first_app) as client:    # its startup makes its container active
+          client.get("/products")
+
+  def test_second():
+      with TestClient(second_app) as client:   # its startup makes its container active
+          client.get("/orders")
+  ```
+- (new tests) `replace()` after autowiring started: the field of a patched
+  class kept the replaced implementation until `refresh()` -> it gets the new
+  one. `refresh()` is still accepted; it is no longer needed for this.
 - `test_a_real_import_failure_found_later_is_a_warning_once`: the WARNING came
   at once -> the background writer writes it a moment later (still exactly
   once); the test waits for it.
@@ -241,6 +333,8 @@ internal `_release_singletons_at_exit`.
 - An explicit policy for properties whose getter fails.
 - A `Keyed` parameter with a default whose type hints cannot be resolved fails
   instead of using the default.
+- Several applications in one process: a per-request container (`ContextVar`)
+  instead of one active container per process.
 
 ## 0.5.3 - 2026-10-21
 
@@ -421,6 +515,9 @@ exactly as before.
 
 - After `replace()`, an alias still points to the previous registration.
 - Inherited unannotated fields gain no new injection.
+
+(Status in 0.5.4: neither holds any more - `replace()` moves aliases along, and
+inherited unannotated fields are injected.)
 
 ### Earlier changes in this release
 

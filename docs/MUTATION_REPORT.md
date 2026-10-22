@@ -175,23 +175,40 @@ was simplified) and was run again.
 | 0.5.3 | `_still_importing`, the circular-import branch of the module import | 15 | 15 | 0 |
 | 0.5.4 | skipped-module list, load-time check on every route, `validate=True` output | 50 | 50 | 0 |
 | 0.5.4 | the 15 mutants of 0.5.3 again, on the 0.5.4 code | 15 | 15 | 0 |
-| 0.5.4 | "nothing hides": finalizers, tracking, WARNINGs instead of DEBUG/defaults, validation mirroring the container, first-safe-moment load, `check_skipped`, refresh/activate raising | 74 | 74 | 0 |
+| 0.5.4 | "nothing hides": finalizers, tracking, WARNINGs instead of DEBUG/defaults, validation mirroring the container, first-safe-moment load, `check_skipped`, refresh/activate raising | 75 | 75 | 0 |
 | 0.5.4 | independent blind review (Lazy re-entry, scoped creation gates, deferred warnings, long-wait warning, strict keyed/open generics, bridges, disposal) and the real-application second look (same ready object, read-only properties) | 51 | 51 | 0 |
 | 0.5.4 | second blind review (background warning writer, Lazy and scope close through the creation gates, library-lock wait warning, late-module checks with `validate=True`, refresh ties, validation through `Lazy`/type variables, cancelled ASGI cleanup, pinned containers) | 39 | 39 | 0 |
-| 0.5.4 | root fixes (positional-only parameters, one type-hint pass, `injected()` filling the built object, rebuilt signatures, deferred annotations on 3.14, optional keyed dependencies, unsupported `Keyed` forms, `validate=True` of a container without weak references) | 61 | 61 | 0 |
-| **0.5.4 total** | | **290** | **290** | **0** |
+| 0.5.4 | root fixes (positional-only parameters, one type-hint pass, `injected()` filling the built object, rebuilt signatures, deferred annotations on 3.14, optional keyed dependencies, unsupported `Keyed` forms, `validate=True` of a container without weak references) | 59 | 59 | 0 |
+| 0.5.4 | third review: background writer surviving a failing handler, `_is_validating` guard, scope close rolled back on a lock cycle, `replace()` moving aliases | 10 | 10 | 0 |
+| 0.5.4 | the request check (another container active -> error before anything is built; FastAPI, Flask, Django, `injected()`) | 7 | 7 | 0 |
+| 0.5.4 | the name map following registration changes (`replace()` without `refresh()`), rebuild order, single read of a cached choice | 12 | 12 | 0 |
+| 0.5.4 | a ready singleton returning at once (the speed fix) | 4 | 4 | 0 |
+| **0.5.4 total** | | **322** | **322** | **0** |
 
-The last run executed all 290 together on the final code: 285 with Python 3.11
+The last run executed all 322 together on the final code: 317 with Python 3.11
 and the 5 that change code used only on 3.14+ with Python 3.14, three mutants at
-a time, each in its own copy of the repository, with the same 300 s limit per
-mutant as before. Every mutant was killed by a failing assertion; none by the
-time limit (the slowest took 70 s). 12 earlier mutants are no longer run: their
-target code was removed or rewritten (2 in the second review; 5 positional-only
-validation checks and 5 warnings that the root fixes replaced). Their
-successors are among the 61.
+a time, each in its own copy of the repository, with a 300 s limit per mutant.
+Before any mutant ran, the same test list ran without a mutant and had to pass
+(551 passed, 3 skipped, on both interpreters); a failing baseline stops the run.
+Every mutant was killed by a failing assertion; none by the time limit (the
+slowest took 82 s). 10 earlier mutants are no longer run: their target code was
+removed or rewritten by the root fixes (5 positional-only validation checks and
+5 warnings); their successors are among the 59.
+
+**An earlier, wrong result.** An earlier version of this section (in a local
+commit, never published) reported "290 of 290 killed". That run was invalid:
+one test in the list failed even without a mutant, and the tool, which stopped
+at the first failure, counted every mutant as killed. The failing test showed a
+real defect (`injected()` could fill a field from another application's
+container), which was fixed. Since then the tool runs the baseline first, as
+described above, and the whole set was run again; 7 mutants that the invalid
+run had hidden survived and each got a test.
 
 Survivors met on the way (all fixed, none equivalent): a validation path that
 skipped a loaded file when the automatic load had run without an active
 container (new test), a weak signature test, two duck-container conditions, a
 missing "two candidates, different scores" test, a duplicated filter in the
-load step (code simplified), and a missing non-strict open-generic control.
+load step (code simplified), a missing non-strict open-generic control, the 7
+above, and in the last rounds: a registration made while the name map was being
+rebuilt, a skipped fallback counted as a change, a cached "no registration"
+answer computed again, and a transient registration carrying an instance.

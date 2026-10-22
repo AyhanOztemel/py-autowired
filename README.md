@@ -204,7 +204,8 @@ problem; use it only when you have that problem.
 ### Validate at startup
 
 **Why:** a missing registration normally shows up only when the field is used.
-**Benefit:** all wiring problems are reported at startup, in one error.
+**Benefit:** the wiring problems of everything the `*_instance` fields reach
+are reported at startup, in one error (see *Known limits*).
 **How:**
 
 ```python
@@ -360,8 +361,22 @@ Objects given to `register_instance` are never closed. After `close()`,
 container.replace(IProductRepository, FakeProductRepository)
 ```
 
-Use a fresh container per test. If you replace a registration after
-autowiring has started, call `refresh()` before creating new consumers.
+Use a fresh container per test. A registration replaced after autowiring has
+started reaches the consumers created afterwards (no `refresh()` needed).
+Aliases of the replaced type (`register_alias`) follow the replacement.
+
+Several FastAPI applications in one test session: open each with `with`, so
+its startup makes its container the active one:
+
+```python
+def test_first():
+    with TestClient(first_app) as client:
+        client.get("/products")
+
+def test_second():
+    with TestClient(second_app) as client:
+        client.get("/orders")
+```
 
 ### FastAPI parameter style
 
@@ -378,7 +393,8 @@ discovery) if `__init__` needs its fields.
 
 The library logs to `logging.getLogger("py_autowired")` and writes nothing
 while everything is fine. Anything that could hide a problem is a WARNING (or
-an ERROR), never a DEBUG-only line:
+an ERROR), never a DEBUG-only line - shown when the application configures
+`logging` (the library adds no handler of its own):
 
 - a project file that cannot be imported or discovered;
 - a field with no matching registration (once per field; it stays `None`);
@@ -401,7 +417,7 @@ Set `PY_AUTOWIRED_DEBUG=1` before import for detailed DEBUG output.
 
 A project file that imports the application module while that module is
 still starting (for example `main.py` doing `from app import app`) cannot be
-loaded during discovery. It is not lost, and nothing about it is hidden:
+loaded during discovery. It is not lost; its problems are logged and checked:
 
 - startup logs it at INFO: `Skipped main during discovery: ... it is checked when it loads`;
 - the moment it loads, its `*_instance` fields are filled **and checked** the
@@ -486,8 +502,13 @@ of its own by `validate_autowiring()`.
 - **Shutdown of the Flask/Django bridges:** container-created singletons are
   closed at process exit; one that only has `aclose()` is closed in a short
   event loop.
-- **One container per process:** class patches are process-wide; run separate
-  applications in separate processes.
+- **One container per process:** class patches are process-wide; several
+  applications in one process are not supported - run them in separate
+  processes (real support comes in 0.6.0, with a per-request container). A
+  request (FastAPI, Flask, Django) or an `injected()` call whose container is
+  not the active one fails before anything is built. This check is a
+  best-effort catch, not a guarantee. Applications used one after another
+  (tests) are fine: each startup makes its own container the active one.
 - **Discovery imports modules** under the project folder. Use `exclude_dirs` for
   folders that must not be imported. `tests` and `examples` folders inside the
   project are skipped automatically (as are `venv`, `.venv`, `site-packages`,
@@ -509,6 +530,46 @@ of its own by `validate_autowiring()`.
   warm caches; measure on your machine with
   `python -B benchmarks/field_injection.py --number 100000 --repeat 5`.
 
+## Known limits (0.5.4)
+
+What 0.5.4 does not promise, in one place:
+
+- **Logs reach you only through your logging setup.** The library adds no
+  handler of its own: without a configured `logging`, its WARNINGs and ERRORs
+  are not shown.
+- **Validation covers the graph reachable from `*_instance` fields.** A
+  registered service no field reaches is not checked. A wrong or empty
+  `root_dir` is a WARNING, also with `validate=True` (code that only registers
+  services by hand is valid).
+- **Many problems are made visible, not prevented.** The library writes a
+  WARNING and goes on in these cases: a factory that waits (`thread.join()`,
+  an `Event`) for a worker needing the very service being created, and an
+  import during `auto_inject()` that waits for another thread using the
+  library, can hang (a WARNING names both threads after 10 s); equally good
+  candidates use the first registration; a singleton that resolves a scoped
+  service may keep it; a property whose getter fails is skipped; a class
+  created while the library is busy gets its fields only once the library is
+  free; a `Keyed` parameter with a default whose type hints cannot be resolved
+  uses the default. "Coming in 0.6.0" lists those that will become errors.
+- **One container per process** (see Notes). The check is made when a request
+  starts: a container activated while the request runs, and objects built
+  OUTSIDE a request (a script, a background thread), are not caught - they use
+  the active container (0.6.0: a per-request container). Without any active
+  container (no application has started yet, e.g. only `TestClient`s without
+  `with`), fields that are not found stay `None` with a WARNING, as in 0.5.3.
+  Mixing the two does not work: after an application opened with `with` has
+  stopped, its container stays active, so every request of another application
+  used without `with` fails - open every application with `with`, or call
+  `activate_container(container)` first.
+- **A scope closed inside a factory** (a factory that opens and closes a scope
+  of its own) runs that scope's finalizers while the factory's creation lock is
+  held. The library's own closing never does: when the closing thread holds a
+  lock a creation in that scope waits for, nothing is closed, the scope stays
+  open and `CircularDependencyError` is raised - close it again without the lock.
+- *(Resolved in 0.5.4)* Two limits of earlier changelogs no longer hold:
+  `replace()` moves the aliases of the replaced type along, and fields assigned
+  in an inherited `__init__` without annotation are injected.
+
 ## Coming in 0.6.0
 
 These change behaviour that working code may rely on, so in 0.5.4 they are only
@@ -526,6 +587,13 @@ visible (a WARNING or a validation issue); 0.6.0 changes them:
 - An explicit policy for properties whose getter fails.
 - A `Keyed` parameter with a default whose type hints cannot be resolved fails
   instead of using the default.
+- Several applications in one process: a per-request container (`ContextVar`)
+  instead of one active container per process.
+
+To be evaluated for 0.6.0: an optional check of every registration (not only
+those the fields reach) and a report that explains why a field received the
+service it did. Order of work: the shared construction plan and the startup
+outside the library lock come first.
 
 ## Test quality
 
@@ -538,7 +606,9 @@ openly. The code added in 0.5.1 (bridges, late imports, prefixes) was tested
 the same way: 329 mutants, **99.0%** killed among those that can change
 behavior; the code changed in 0.5.2 (several implementations per contract,
 upper case field names): 216 mutants, **100%** of those that can change
-behavior killed. Full report: [docs/MUTATION_REPORT.md](https://github.com/AyhanOztemel/py-autowired/blob/main/docs/MUTATION_REPORT.md).
+behavior killed. The code changed in 0.5.3 and 0.5.4 was tested with
+hand-written mutants: 322 mutants, **all killed** (each run first runs the
+tests without a mutant, and stops if they do not pass). Full report: [docs/MUTATION_REPORT.md](https://github.com/AyhanOztemel/py-autowired/blob/main/docs/MUTATION_REPORT.md).
 
 ## License
 

@@ -202,7 +202,8 @@ Yukarıdaki kurulum için bunların hiçbiri gerekmez. Her biri belirli bir soru
 ### Açılışta doğrulama
 
 **Neden:** eksik bir kayıt normalde ancak alan kullanılınca ortaya çıkar.
-**Faydası:** bütün bağlantı sorunları açılışta, tek hatada raporlanır.
+**Faydası:** `*_instance` alanlarının ulaştığı her şeyin bağlantı sorunları
+açılışta, tek hatada raporlanır (bkz. *Bilinen sınırlar*).
 **Kullanımı:**
 
 ```python
@@ -359,8 +360,24 @@ container.replace(IProductRepository, FakeProductRepository)
 ```
 
 Her test için yeni bir container kullanın. Otomatik enjeksiyon başladıktan
-sonra bir kaydı değiştirirseniz yeni tüketiciler oluşturmadan önce
-`refresh()` çağırın.
+sonra değiştirilen bir kayıt, ondan sonra oluşturulan tüketicilere ulaşır
+(`refresh()` gerekmez). Değiştirilen türün alias'ları (`register_alias`) da yeni
+kaydı izler.
+
+Aynı test oturumunda birden fazla FastAPI uygulaması kullanıyorsanız her birini
+`with` ile açın: açılışı kendi container'ını etkinleştirir. Başka bir uygulamanın
+container'ı etkinken gelen istek, çözümü söyleyen açık bir hata alır; gerekirse
+testler arasında `activate_container(container)` çağırın.
+
+```python
+def test_ilk():
+    with TestClient(ilk_uygulama) as client:      # açılış ve kapanış çalışır
+        client.get("/urunler")
+
+def test_ikinci():
+    with TestClient(ikinci_uygulama) as client:   # açılışı kendi container'ını etkinleştirir
+        client.get("/siparisler")
+```
 
 ### FastAPI parametre tarzı
 
@@ -377,7 +394,8 @@ projeye taşıyın.
 
 Kütüphane `logging.getLogger("py_autowired")` üzerinden log yazar; her şey
 yolundayken hiçbir şey yazmaz. Bir sorunu gizleyebilecek her durum WARNING (ya da
-ERROR) olarak yazılır, hiçbiri yalnız DEBUG'da kalmaz:
+ERROR) olarak yazılır, hiçbiri yalnız DEBUG'da kalmaz - uygulama `logging`'i
+yapılandırmışsa görünür (kütüphane kendi log çıkışını kurmaz):
 
 - import edilemeyen ya da keşfedilemeyen proje dosyası;
 - eşleşen kaydı olmayan alan (alan başına bir kez; alan `None` kalır);
@@ -399,7 +417,7 @@ Ayrıntılı DEBUG çıktısı için import'tan önce `PY_AUTOWIRED_DEBUG=1` aya
 
 Uygulama modülü henüz açılırken onu import eden bir proje dosyası (örneğin
 `from app import app` yapan `main.py`) tarama sırasında yüklenemez. Bu dosya
-kaybolmaz ve onunla ilgili hiçbir şey gizlenmez:
+kaybolmaz; sorunları loga yazılır ve denetlenir:
 
 - açılışta INFO olarak yazılır: `Skipped main during discovery: ... it is checked when it loads`;
 - dosya yüklendiği anda `*_instance` alanları doldurulur **ve denetlenir**
@@ -482,8 +500,13 @@ bir satırda adıyla bildirir.
 - **Flask/Django köprülerinde kapanış:** container'ın oluşturduğu singleton'lar
   süreç çıkışında kapatılır; yalnız `aclose()` olanı kısa bir olay döngüsünde
   kapatılır.
-- **Süreç başına bir container:** sınıf yamaları süreç geneline uygulanır; ayrı
-  uygulamaları ayrı süreçlerde çalıştırın.
+- **Süreç başına bir container:** sınıf yamaları süreç geneline uygulanır; aynı
+  süreçte birden çok uygulama desteklenmez - ayrı uygulamaları ayrı süreçlerde
+  çalıştırın (gerçek destek 0.6.0'da, istek başına container ile). Container'ı
+  etkin olmayan bir istek (FastAPI, Flask, Django) ya da `injected()` çağrısı
+  hiçbir şey kurulmadan hata verir. Bu denetim en iyi çaba ile yapılan bir
+  yakalamadır, garanti değildir. Art arda kullanılan uygulamalar (testler)
+  sorunsuzdur: her açılış kendi container'ını etkinleştirir.
 - **Tarama modülleri import eder:** proje klasörü altındaki modüller import
   edilir. Import edilmemesi gereken klasörler için `exclude_dirs` kullanın. Proje
   içinde tutulan bir kütüphane kopyası (vendor) ya da ikinci bir kurulum adıyla
@@ -504,6 +527,46 @@ bir satırda adıyla bildirir.
   birkaç mikrosaniye ekler; kendi makinenizde ölçmek için
   `python -B benchmarks/field_injection.py --number 100000 --repeat 5`.
 
+## Bilinen sınırlar (0.5.4)
+
+0.5.4'ün söz vermedikleri, tek yerde:
+
+- **Loglar ancak sizin logging ayarınızla görünür.** Kütüphane kendi log
+  çıkışını kurmaz: `logging` yapılandırılmamışsa WARNING ve ERROR satırları
+  gösterilmez.
+- **Doğrulama, `*_instance` alanlarından ulaşılan grafiği kapsar.** Hiçbir
+  alanın ulaşmadığı kayıtlı servis denetlenmez. Yanlış ya da boş `root_dir`,
+  `validate=True` ile de WARNING'dir (servisleri yalnız elle kaydeden kod
+  geçerlidir).
+- **Birçok sorun önlenmez, görünür yapılır.** Bu durumlarda kütüphane WARNING
+  yazıp devam eder: oluşturmakta olduğu servise ihtiyaç duyan bir worker'ı
+  (`thread.join()`, `Event`) bekleyen factory ve `auto_inject()` sırasında
+  kütüphaneyi kullanan başka bir thread'i bekleyen import donabilir (10 sn sonra
+  iki thread'i adlandıran WARNING); eşit adaylarda ilk kayıt kullanılır; scoped
+  servis çözen singleton onu saklayabilir; getter'ı hata veren property atlanır;
+  kütüphane meşgulken oluşturulan sınıf alanlarını kütüphane boşalınca alır; tür
+  ipuçları çözülemeyen, varsayılanı olan `Keyed` parametre varsayılanı alır.
+  Hata olacakları "0.6.0'da gelecek" listeler.
+- **Süreç başına bir container** (bkz. Notlar). Denetim istek başlarken yapılır:
+  istek sürerken etkinleştirilen bir container ve istek DIŞINDA (betik, arka plan
+  thread'i) kurulan nesneler yakalanmaz - etkin container'ı kullanırlar (0.6.0:
+  istek başına container). Hiç etkin container yokken (henüz hiçbir uygulama
+  açılmamış, ör. yalnız `with` olmadan `TestClient`) bulunamayan alanlar
+  0.5.3'teki gibi `None` kalır ve WARNING verilir. İkisini karıştırmak çalışmaz:
+  `with` ile açılan bir uygulama durduktan sonra container'ı etkin kalır, bu
+  yüzden `with` olmadan kullanılan başka bir uygulamanın her isteği hata verir -
+  her uygulamayı `with` ile açın ya da önce `activate_container(container)`
+  çağırın.
+- **Factory içinde kapatılan scope** (kendi scope'unu açıp kapatan bir factory)
+  temizleyicilerini factory'nin oluşturma kilidi tutulurken çalıştırır.
+  Kütüphanenin kendi kapanışı bunu asla yapmaz: kapatan thread o scope'taki bir
+  oluşturmanın beklediği bir kilidi tutuyorsa hiçbir şey kapatılmaz, scope açık
+  kalır ve `CircularDependencyError` verilir - kilit bırakıldıktan sonra yeniden
+  kapatın.
+- *(0.5.4'te çözüldü)* Eski changelog'lardaki iki sınır artık geçerli değil:
+  `replace()` değiştirilen türün alias'larını da yeni kayda taşır; kalıtılan
+  `__init__` içinde açıklamasız atanan alanlar enjekte edilir.
+
 ## 0.6.0'da gelecek
 
 Bunlar çalışan kodun dayanabileceği davranışı değiştirir; bu yüzden 0.5.4'te
@@ -521,6 +584,13 @@ yalnız görünürdürler (WARNING ya da doğrulama sorunu), 0.6.0'da değişece
 - Getter'ı hata veren property'ler için açık bir kural.
 - Tür ipuçları çözülemediğinde varsayılanı olan `Keyed` parametre, varsayılanı
   almak yerine hata verecek.
+- Aynı süreçte birden çok uygulama: süreç başına tek etkin container yerine
+  istek başına container (`ContextVar`).
+
+0.6.0 için değerlendirilecek: yalnız alanların ulaştıklarını değil, bütün
+kayıtları denetleyen isteğe bağlı bir doğrulama ve "bu alan neden bu servisi
+aldı?" sorusunu yanıtlayan bir açıklama raporu. İş sırası: önce ortak oluşturma
+planı ve kütüphane kilidinin dışında import eden açılış.
 
 ## Test kalitesi
 
@@ -531,7 +601,9 @@ kalanların eşdeğer olduğu gerekçeleriyle kanıtlandı). Ne yakalanan ne de 
 olduğu kanıtlanan 9 mutant açıkça listelendi. 0.5.1'de eklenen kod: 329 mutant,
 davranışı değiştirebilenlerin **%99,0**'ı; 0.5.2'de değişen kod (bir sözleşmenin
 birden çok uygulaması, büyük harfli alan adları): 216 mutant, davranışı
-değiştirebilenlerin **%100**'ü yakalandı. Rapor:
+değiştirebilenlerin **%100**'ü yakalandı. 0.5.3 ve 0.5.4'te değişen kod elle
+yazılmış mutantlarla sınandı: 322 mutant, **hepsi** yakalandı (her koşu önce
+testleri mutantsız çalıştırır; geçmezlerse durur). Rapor:
 [docs/MUTATION_REPORT.md](https://github.com/AyhanOztemel/py-autowired/blob/main/docs/MUTATION_REPORT.md).
 
 ## Lisans

@@ -263,7 +263,7 @@ def test_y4_waiting_for_the_library_lock_is_reported(monkeypatch, caplog):
 def project(tmp_path, monkeypatch):
     tags = []
 
-    def build(files, validate=False, app_tail=""):
+    def build(files, validate=False, app_tail="", container="Container()"):
         tag = uuid.uuid4().hex[:8]
         tags.append(tag)
         root = tmp_path / f"r3_{tag}"
@@ -274,7 +274,7 @@ def project(tmp_path, monkeypatch):
             from pathlib import Path
             from py_autowired import Container, autowired
             from clock_{tag} import Clock
-            container = Container()
+            container = {container}
             container.register_singleton(Clock)
             autowired.auto_inject(container, root_dir=str(Path(__file__).resolve().parent), validate={validate})
             app = "ready"
@@ -380,6 +380,25 @@ def test_a9_a_later_auto_inject_without_validate_clears_it(project, monkeypatch)
     assert error is None and module is not None
 
 
+UNHASHABLE = "type('UnhashableContainer', (Container,), {'__eq__': lambda s, o: s is o, '__hash__': None})()"
+
+
+def test_t3_2_validate_is_kept_for_a_real_unhashable_container(project):
+    """Third review: a real container class with __hash__ = None (it CAN be weakly referenced)."""
+    _root, tag = project({"dist/late_TAG.py": MISSING}, validate=True, container=UNHASHABLE)
+    app = importlib.import_module(f"app_{tag}")
+    assert type(app.container).__hash__ is None
+    module, error = _import(f"late_{tag}")
+    assert isinstance(error, AutowiringValidationError), f"late import broke or was not checked: {error!r}"
+
+
+def test_t3_2_an_unhashable_container_without_validate_imports_late_modules(project):
+    _root, tag = project({"dist/late_TAG.py": MISSING}, container=UNHASHABLE)
+    importlib.import_module(f"app_{tag}")
+    module, error = _import(f"late_{tag}")
+    assert error is None and module is not None, f"late import broke: {error!r}"
+
+
 # ---- Z4 (Y6b): ties created after startup are reported by refresh() -----------------------
 
 def test_z4_refresh_reports_a_tie_created_after_startup(graph, caplog):
@@ -426,6 +445,21 @@ def test_y7_a_deferred_file_that_cannot_import_fails_the_first_injection(project
         error = caught
     assert isinstance(error, AutowiringValidationError)
     assert any(f"main_{tag}: could not be imported" in issue for issue in error.issues)
+
+
+def test_n10_without_validate_a_later_import_failure_is_a_validation_issue(project):
+    _root, tag = project({
+        f"main_TAG.py": "from app_TAG import app\nimport does_not_exist_pkg_n10\n",
+        "other_TAG.py": "class Other:\n    clock_instance = None\n",
+    })
+    app = importlib.import_module(f"app_{tag}")
+    sys.modules[f"other_{tag}"].Other()                    # the first injection loads the skipped file
+    try:
+        validate_autowiring(app.container)
+        issues = ()
+    except AutowiringValidationError as error:
+        issues = error.issues
+    assert any(f"main_{tag}: could not be imported after startup" in issue for issue in issues), issues
 
 
 # ---- Y8 = Z7: Lazy[Transient] -> Scoped held by a singleton --------------------------------
@@ -523,6 +557,7 @@ def test_y11_injected_names_a_field_it_cannot_fill(caplog):
     class _Request:
         app = _App()
 
+    autowired.activate_container(_State.py_autowired_container)  # what its startup does
     with caplog.at_level(logging.DEBUG, logger="py_autowired"):
         asyncio.run(injected(NeverPatched)(_Request()))
         asyncio.run(injected(NeverPatched)(_Request()))
@@ -602,6 +637,8 @@ def test_y15_cleanup_error_is_not_lost_after_repeated_cancellation():
             pass
 
     wrapped = AsgiRequestScope(application, container, _Ready())
+
+    autowired.activate_container(container)  # what the real startup does
 
     async def main():
         task = asyncio.ensure_future(wrapped({"type": "http"}, None, None))
@@ -833,6 +870,8 @@ def test_guard_a_cancelled_request_still_reports_its_cancellation():
             pass
 
     wrapped = AsgiRequestScope(application, container, _Ready())
+
+    autowired.activate_container(container)  # what the real startup does
 
     async def main():
         task = asyncio.ensure_future(wrapped({"type": "http"}, None, None))

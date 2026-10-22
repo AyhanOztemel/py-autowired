@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from .autowired import _find_project_root, activate_container, auto_inject
+from .autowired import _check_active, _find_project_root, activate_container, auto_inject
 from .container import Container
 
 
@@ -98,6 +98,7 @@ class WsgiRequestScope:
 
     def __call__(self, environ: dict, start_response: Any) -> Iterable[bytes]:
         self.startup.ensure()
+        _check_active(self.container)  # another container is active: fail before building
         scope = self.container.create_scope()
         scope.__enter__()
         try:
@@ -121,6 +122,7 @@ class AsgiRequestScope:
             await self.app(scope, receive, send)
             return
         self.startup.ensure()
+        _check_active(self.container)  # another container is active: fail before building
         request_scope = self.container.create_scope()
         await request_scope.__aenter__()
         try:

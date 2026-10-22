@@ -2,7 +2,9 @@ from abc import ABC, abstractmethod
 import asyncio
 from pathlib import Path
 
-from py_autowired.autowired import auto_inject
+import pytest
+
+from py_autowired.autowired import activate_container, auto_inject
 from py_autowired.container import Container
 
 
@@ -54,6 +56,13 @@ container.register_singleton(IClock, Clock)
 container.register_scoped(IRepository, Repository)
 container.register_transient(Service)
 auto_inject(container, root_dir=str(Path(__file__).resolve().parents[1]))
+
+
+@pytest.fixture(autouse=True)
+def _this_module_s_container():
+    """auto_inject() above ran when this module was collected; other test modules may have
+    activated their own container since (the active container is process-wide)."""
+    activate_container(container)
 
 
 def test_nested_runtime_injection_uses_instance_fields_only():
