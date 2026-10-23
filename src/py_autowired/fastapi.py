@@ -17,8 +17,10 @@ from fastapi import FastAPI, Request
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .autowired import (
-    _check_active, _find_project_root, _inject_unpatched, activate_container, auto_inject,
+    _check_active, _find_project_root, _inject_unpatched, _warn_unfilled_registered,
+    activate_container, auto_inject,
 )
+from . import autowired
 from .container import Container
 
 
@@ -113,22 +115,41 @@ def injected(service_type: type[T]) -> Callable[[Request], Coroutine[Any, Any, T
 
     Registered types retain their configured lifetime. Unregistered controller
     classes are constructed without arguments and receive the same automatic
-    field injection. A class discovery never patched (outside the project root,
-    or created after startup) is not changed: the None fields of the object built
-    here are filled after its ``__init__`` returns, so ``__init__`` itself cannot
-    use them yet. If another application's container is the active one, it
+    field injection. An unregistered class discovery never patched (outside the
+    project root, or created after startup) is not changed: the None fields of
+    the object built here are filled after its ``__init__`` returns, so
+    ``__init__`` itself cannot use them yet. A REGISTERED type whose class was
+    never patched is not filled from here (a shared singleton would keep the
+    first request's objects): each None field stays ``None`` with a WARNING
+    naming it - move the class into the project root or use constructor
+    injection. If another application's container is the active one, it
     raises ``DependencyInjectionError`` before building anything (one container
-    per process; a best-effort catch, not a guarantee). Dependencies are async so
-    resolution stays in the request context even when the endpoint itself is
-    synchronous.
+    per process; a best-effort catch, not a guarantee). With no active container
+    at all (startup has not run, e.g. a ``TestClient`` used without ``with``) the
+    fields are not filled, as in 0.5.3: each one stays ``None`` with a WARNING
+    naming it. Dependencies are async so resolution stays in the request context
+    even when the endpoint itself is synchronous.
     """
+    # The class last found patched, per branch: its patched __init__ handles its fields, and a
+    # patched class stays patched - the checks below run again only for another class.
+    registered_patched = built_patched = None
+
     async def dependency(request: Request) -> T:
+        nonlocal registered_patched, built_patched
         container: Container = request.app.state.py_autowired_container
-        _check_active(container)  # before resolving or building anything
+        active = autowired._NAME_MAP_CACHE  # _check_active's own test, inline; it raises
+        if active is not None and active._container is not container:
+            _check_active(container)  # before resolving or building anything
         if container.is_registered(service_type):
-            return container.resolve(service_type)
+            instance = container.resolve(service_type)
+            cls = type(instance)
+            if cls is not registered_patched and _warn_unfilled_registered(instance):
+                registered_patched = cls  # never filled from here: said, not silent
+            return instance
         instance = service_type()
-        _inject_unpatched(instance, container)
+        cls = type(instance)
+        if cls is not built_patched and _inject_unpatched(instance, container):
+            built_patched = cls
         return instance
 
     return dependency

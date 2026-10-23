@@ -198,6 +198,9 @@ def _graph_with(service):
                                       "__module__": "hid_consumers"})
     autowired._patch_setattr(Consumer, container, {})
     autowired._patch_init(Consumer, container, {})
+    # Validation follows the classes it tracks weakly (a class that died builds no object): the
+    # consumer lives as long as the container - a garbage collection in between made the tests flaky.
+    container.kept_consumer = Consumer
     return container
 
 

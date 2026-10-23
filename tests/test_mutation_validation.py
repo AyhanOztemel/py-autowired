@@ -159,8 +159,11 @@ def test_unpatched_registered_class_fields_are_not_followed(graph):
     assert _issues(container) == []
 
 
-def test_inherited_field_warning_rules(graph, caplog):
+def test_inherited_field_warning_rules(graph, caplog, monkeypatch):
     container, patch = graph
+    # Base stands for a PROJECT class (its module "app.c" is not loaded): a base outside the
+    # project is read like the class itself since 0.5.4 (tests/test_base_fields.py).
+    monkeypatch.setattr(autowired, "_in_project", lambda cls: True)
     base = type("Base", (), {"__module__": "app.c", "x_instance": None,
                              "y_instance": "set", "helper": None})
     child = type("Child", (base,), {"__module__": "app.c"})

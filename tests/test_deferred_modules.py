@@ -111,6 +111,18 @@ def _records(caplog, level, *parts):
             if r.levelno == level and all(part in r.getMessage() for part in parts)]
 
 
+def _records_soon(caplog, level, *parts, timeout=5.0):
+    """The records of another thread (the background drain): it writes them right after it
+    releases the library lock (0.5.4 round 20: never while holding it), so they may come a moment
+    after the lock is free - wait for them, never for longer than ``timeout``."""
+    deadline = time.monotonic() + timeout
+    found = _records(caplog, level, *parts)
+    while not found and time.monotonic() < deadline:
+        time.sleep(0.01)
+        found = _records(caplog, level, *parts)
+    return found
+
+
 def _call(function, *args):
     """Call; return the error instead of raising it."""
     try:
@@ -206,8 +218,9 @@ def test_a_file_loaded_while_another_thread_holds_the_lock_is_checked_afterwards
         holder.join(5)
     with caplog.at_level(logging.DEBUG, logger="py_autowired"):
         autowired.refresh()                                     # next lock holder checks it
+        found = _records_soon(caplog, logging.ERROR, f"main_{tag}", "no matching registration")
     assert module is not None
-    assert len(_records(caplog, logging.ERROR, f"main_{tag}", "no matching registration")) == 1
+    assert len(found) == 1
 
 
 def test_validate_autowiring_checks_a_file_the_import_hook_did_not_see(make_project, monkeypatch):
@@ -518,9 +531,10 @@ def test_a_queued_failure_with_validate_is_raised_by_the_next_auto_inject(make_p
     app = importlib.import_module(f"app_{tag}")
     with caplog.at_level(logging.DEBUG, logger="py_autowired"):
         module, error = _import_while_the_lock_is_busy(f"main_{tag}")
+        found = _records_soon(caplog, logging.ERROR, f"main_{tag}", "no matching registration")
     assert error is None and module is not None             # the import finished; nobody to raise to
     # The background drain checked it at once: ERROR now, the raise is kept for the next call.
-    assert len(_records(caplog, logging.ERROR, f"main_{tag}", "no matching registration")) == 1
+    assert len(found) == 1
     try:
         autowired.auto_inject(app.container, root_dir=str(root))
         later = None

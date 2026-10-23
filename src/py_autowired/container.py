@@ -21,23 +21,126 @@ from typing import Annotated, Any, Callable, Dict, Generic, Optional, Type, Type
 
 T = TypeVar("T")
 _UNSET = object()
-logger = logging.getLogger("py_autowired")
+class _HeldLogger:
+    """The library's logger. While this thread holds a library lock (_HELD), a record is kept and
+    written when the last one is released - a log handler may take locks of its own. Every log
+    call of the library goes through it; anything else (handlers, level) is the real logger's."""
+
+    __slots__ = ("_logger",)
+
+    def __init__(self, real: logging.Logger) -> None:
+        self._logger = real
+
+    def _log(self, level: int, message: str, args: tuple, kwargs: dict) -> None:
+        # No isEnabledFor() here: on a cache miss it takes logging's own lock, which dictConfig holds
+        # while it runs the user's factories - under a library lock that can be a cycle. log() checks
+        # the level itself, outside the library locks (now, or when a kept record is written).
+        if _HELD.count:
+            if kwargs.get("exc_info") is True:  # the exception of now, not of the release
+                kwargs["exc_info"] = sys.exc_info()
+            _HELD.__dict__.setdefault("pending", []).append((level, message, args, kwargs))
+        else:
+            self._logger.log(level, message, *args, stacklevel=3, **kwargs)
+
+    def debug(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.DEBUG, message, args, kwargs)
+
+    def info(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.INFO, message, args, kwargs)
+
+    def warning(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.WARNING, message, args, kwargs)
+
+    def error(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.ERROR, message, args, kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._logger, name)
+
+
+logger = _HeldLogger(logging.getLogger("py_autowired"))
 _WARNED: set = set()  # keys of the once-only warnings already written
-# Resolution depth of this thread. A log handler may take its own locks (or
-# resolve services): warnings raised while resolving wait until the outermost
-# resolution has released every creation lock.
-_RESOLVING = threading.local()
+# A leaf lock: only the set's check and add run under it (on plain keys only: no user code), so
+# the check and the add are one step on the free-threaded build too. The log line is written
+# outside it.
+_WARNED_LOCK = threading.Lock()
+# The library locks this thread holds now. A log handler may take its own locks (or wait for
+# another thread): while this thread holds ANY library lock, _warn_once keeps its WARNING and the
+# release of the last one writes them all (0.5.4 round 19: the measure is the locks held, not the
+# resolution depth - a resolution that takes no lock pays nothing).
+class _HeldLocks(threading.local):
+    count = 0  # class defaults: what a thread that holds nothing reads
+    pending = None
+
+
+_HELD = _HeldLocks()
+
+
+def _hold() -> None:
+    _HELD.count += 1
+
+
+def _unhold() -> None:
+    """After a library lock was released: the last one writes what was kept meanwhile. Never below
+    zero (a negative count would keep every later WARNING forever)."""
+    held = _HELD
+    if held.count > 0:
+        held.count -= 1
+    if not held.count and held.pending:
+        _flush_warnings()
+
+
+class _LibraryLock:
+    """A library lock (re-entrant or not) that counts itself as held by this thread while taken -
+    see _HeldLocks. Used with ``with`` or acquire()/release()."""
+
+    __slots__ = ("_lock",)
+
+    def __init__(self, reentrant: bool = False) -> None:
+        self._lock = threading.RLock() if reentrant else threading.Lock()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        got = self._lock.acquire(blocking, timeout)
+        if got:
+            _hold()
+        return got
+
+    def release(self) -> None:
+        self._lock.release()
+        _unhold()
+
+    def _is_owned(self) -> bool:
+        return self._lock._is_owned()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def __enter__(self) -> bool:
+        return self.acquire()
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.release()
+
+
+def _first_time(key) -> bool:
+    """True once per key. A key with a part that is not exactly a str or None (its type checked
+    with `is`: no user code) is never noted - its WARNING is written every time, and nothing of
+    the user's is kept or hashed under the lock."""
+    for part in key:
+        if type(part) is not str and part is not None:
+            return True
+    with _WARNED_LOCK:
+        if key in _WARNED:
+            return False
+        _WARNED.add(key)
+        return True
 
 
 def _warn_once(key, message: str, *args: Any) -> None:
     """A WARNING that repeats nothing: one line per problem, not per call."""
-    if key in _WARNED:
+    if not _first_time(key):
         return
-    _WARNED.add(key)
-    if getattr(_RESOLVING, "depth", 0):
-        _RESOLVING.__dict__.setdefault("pending", []).append((message, args))
-    else:
-        logger.warning(message, *args)
+    logger.warning(message, *args)  # kept while a library lock is held (_HeldLogger)
 
 
 class _BackgroundLog:
@@ -93,18 +196,23 @@ _BACKGROUND_LOG = _BackgroundLog()
 
 def _warn_once_background(key, message: str, *args: Any) -> None:
     """_warn_once for a thread that must not run log handlers itself."""
-    if key in _WARNED:
+    if not _first_time(key):
         return
-    _WARNED.add(key)
     _BACKGROUND_LOG.put(message, args)
 
 
 def _flush_warnings() -> None:
-    pending = getattr(_RESOLVING, "pending", None)
+    pending = _HELD.pending
     while pending:
-        message, args = pending.pop(0)
-        logger.warning(message, *args)
+        level, message, args, kwargs = pending.pop(0)
+        logger._logger.log(level, message, *args, **kwargs)
 
+
+# The scope state this context is closing: its finalizers (and what they start with a copy of
+# their context) may still use the objects not finalized yet. The name starts with
+# "py_autowired": a 3.14t thread does not inherit it at birth (_thread_birth).
+_CLOSING: "contextvars.ContextVar[Optional[_ScopeState]]" = contextvars.ContextVar(
+    "py_autowired_closing", default=None)
 
 # The singleton being created in this context (innermost), for N6.
 _SINGLETON_IN_CREATION: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
@@ -373,6 +481,16 @@ def _constructor_hints(function: Any) -> tuple[Dict[str, Any], Dict[str, Any], O
         return {}, extras, error
 
 
+def _field_injection_only(implementation: Type[Any]) -> bool:
+    """True when the class has *_instance fields of its OWN: auto_inject fills them after
+    construction and its __init__ is not resolved. A field it only inherits from a base outside
+    the project does not count (0.5.4): its constructor dependencies are resolved as before."""
+    own = getattr(implementation, "__di_own_attrs__", None)
+    if own is None:
+        own = getattr(implementation, "__di_attrs__", ())  # set before 0.5.4 or by hand
+    return bool(own)
+
+
 @lru_cache(maxsize=1024)
 def _accepts_no_arguments(implementation: Type[Any]) -> bool:
     try:
@@ -611,7 +729,7 @@ class _CreationGate:
 
     def __init__(self, slot: Any) -> None:
         self.slot = slot
-        self.lock = threading.RLock()
+        self.lock = threading.RLock()  # counted as held by _acquire_creation, like a singleton's
 
 
 class _ScopeState:
@@ -620,9 +738,15 @@ class _ScopeState:
         self.instances: Dict[Type[Any], Any] = {}
         self.creation_order: list[Type[Any]] = []
         # Guards the dictionaries only; user code never runs under it.
-        self.lock = threading.RLock()
+        self.lock = _LibraryLock(reentrant=True)
         self.gates: Dict[Any, _CreationGate] = {}  # slot -> gate of its creation in progress
         self.closed = False
+        # The thread that entered it (Scope.__enter__; the 3.14t hard rule): the Thread object itself,
+        # held here, so no later thread can ever be "the same" (a numeric id can be reused).
+        self.thread = threading.current_thread()
+        # While closing: the objects whose finalizer has not run yet. "instances" is emptied at
+        # the start of the close, so the lock-free path below always misses then.
+        self._closing: Dict[Type[Any], Any] = {}
 
     def get_or_create(self, registration: ServiceRegistration, container: "Container") -> Any:
         slot = registration.slot  # == service_type for every unkeyed registration
@@ -631,7 +755,7 @@ class _ScopeState:
             return instance
         with self.lock:
             if self.closed:
-                raise ScopeNotActiveError("The active dependency scope is already closed")
+                return self._from_closing(slot)
             instance = self.instances.get(slot, _UNSET)
             if instance is not _UNSET:
                 return instance
@@ -645,7 +769,7 @@ class _ScopeState:
         try:
             with self.lock:
                 if self.closed:
-                    raise ScopeNotActiveError("The active dependency scope is already closed")
+                    return self._from_closing(slot)
                 instance = self.instances.get(slot, _UNSET)
             if instance is _UNSET:
                 instance = container._create_instance(registration)
@@ -663,14 +787,54 @@ class _ScopeState:
                         del self.gates[slot]
             container._release_creation(gate)
 
-    @staticmethod
-    def _sync_finalize(instance: Any) -> None:
-        finalizer = _first_callable(instance, "dispose", "close")
+    def _from_closing(self, slot: Any) -> Any:
+        """The scope is closed or closing (the caller holds the lock). Only the code closing it
+        gets an object, and only one whose finalizer has not run yet - never a disposed one."""
+        if _CLOSING.get() is self:
+            instance = self._closing.get(slot, _UNSET)
+            if instance is not _UNSET:
+                return instance
+        raise ScopeNotActiveError("The active dependency scope is already closed")
+
+    def _take_for_finalizing(self, slot: Any, finalizer_of: Callable[[Any], Any]) -> tuple:
+        """(object, finalizer) of ``slot`` - the finalizer read once - with the object taken out of
+        the scope BEFORE its finalizer runs: nobody gets it once it is being disposed. An object
+        without a finalizer is never disposed and stays available to the closing code until the
+        close ends: (_UNSET, None)."""
+        with self.lock:
+            instance = self._closing.get(slot, _UNSET)
+        if instance is _UNSET:
+            return _UNSET, None
+        finalizer = finalizer_of(instance)  # outside the lock: may run the object's own code
         if finalizer is None:
-            if callable(getattr(instance, "aclose", None)):
+            return _UNSET, None
+        with self.lock:
+            if self._closing.get(slot, _UNSET) is instance:
+                del self._closing[slot]
+        return instance, finalizer
+
+    @staticmethod
+    def _sync_finalizer(instance: Any) -> Optional[Callable[[], Any]]:
+        """What a sync close calls, read once: dispose/close; for an object that only has
+        aclose, a call that reports it; None: nothing to call (never disposed)."""
+        finalizer = _first_callable(instance, "dispose", "close")
+        if finalizer is None and callable(getattr(instance, "aclose", None)):
+            def requires_async() -> None:
                 raise AsyncDisposalRequiredError(
                     f"{type(instance).__name__} requires 'async with container.create_scope()'"
                 )
+            return requires_async
+        return finalizer
+
+    @staticmethod
+    def _async_finalizer(instance: Any) -> Optional[Callable[[], Any]]:
+        return _first_callable(instance, "aclose", "dispose", "close")
+
+    @staticmethod
+    def _sync_finalize(instance: Any, finalizer: Any = _UNSET) -> None:
+        if finalizer is _UNSET:
+            finalizer = _ScopeState._sync_finalizer(instance)
+        if finalizer is None:
             return
         result = finalizer()
         if inspect.isawaitable(result):
@@ -682,8 +846,9 @@ class _ScopeState:
             )
 
     @staticmethod
-    async def _async_finalize(instance: Any) -> None:
-        finalizer = _first_callable(instance, "aclose", "dispose", "close")
+    async def _async_finalize(instance: Any, finalizer: Any = _UNSET) -> None:
+        if finalizer is _UNSET:
+            finalizer = _ScopeState._async_finalizer(instance)
         if finalizer is None:
             return
         result = finalizer()
@@ -722,25 +887,34 @@ class _ScopeState:
                 raise
             self.container._release_creation(gate)
         with self.lock:
+            # Every creation has finished: swap the objects out of the lock-free path.
+            self._closing, self.instances = self.instances, {}
             return list(self.creation_order)
 
     def _end_close(self) -> None:
-        # Cleared only after finalizers, as in 0.4.0: a finalizer may still use
-        # other ready scoped instances of this scope.
         with self.lock:
+            retired, self._closing = self._closing, {}  # objects without a finalizer end here
             self.instances.clear()
             self.creation_order.clear()
+        del retired  # after the lock: their __del__ may run now
 
     def close(self) -> None:
         order = self._begin_close()
         if order is None:
             return
         errors: list[BaseException] = []
-        for slot in reversed(order):
-            try:
-                self._sync_finalize(self.instances[slot])
-            except BaseException as exc:
-                errors.append(exc)
+        token = _CLOSING.set(self)  # the finalizers below are the closing code
+        try:
+            for slot in reversed(order):
+                try:  # reading the finalizer may fail too: the other objects are still closed
+                    instance, finalizer = self._take_for_finalizing(slot, self._sync_finalizer)
+                    if instance is _UNSET:
+                        continue
+                    self._sync_finalize(instance, finalizer)
+                except BaseException as exc:
+                    errors.append(exc)
+        finally:
+            _CLOSING.reset(token)
         self._end_close()
         if errors:
             _raise_disposal_errors(errors)
@@ -750,11 +924,18 @@ class _ScopeState:
         if order is None:
             return
         errors: list[BaseException] = []
-        for slot in reversed(order):
-            try:
-                await self._async_finalize(self.instances[slot])
-            except BaseException as exc:
-                errors.append(exc)
+        token = _CLOSING.set(self)
+        try:
+            for slot in reversed(order):
+                try:  # reading the finalizer may fail too: the other objects are still closed
+                    instance, finalizer = self._take_for_finalizing(slot, self._async_finalizer)
+                    if instance is _UNSET:
+                        continue
+                    await self._async_finalize(instance, finalizer)
+                except BaseException as exc:
+                    errors.append(exc)
+        finally:
+            _CLOSING.reset(token)
         self._end_close()
         if errors:
             _raise_disposal_errors(errors)
@@ -768,7 +949,7 @@ class Container:
     already-imported concrete subclass.
     """
 
-    _provider_lock = threading.Lock()
+    _provider_lock = _LibraryLock()
     _instance: Optional["Container"] = None
 
     def __init__(
@@ -790,10 +971,13 @@ class Container:
         self.creation_wait_warning: float = 10.0
         self._implementation_selectors: Dict[Type[Any], Callable[[], Type[Any]]] = {}
         self.registration_history: list[tuple[str, Type[Any]]] = []
-        self._registration_lock = threading.RLock()
+        self._registration_lock = _LibraryLock(reentrant=True)
         # Counts changes of the registrations: the active name map rebuilds itself when
         # it differs (a replace() after startup reaches new consumers without refresh()).
         self._changes = 0
+        # A leaf lock for that count only: nothing else is taken and no user code runs under it,
+        # so it joins no lock cycle - the count moves under any lock (a creation lock included).
+        self._change_lock = threading.Lock()
         # Opt-in shutdown (close/aclose): container-created singletons in
         # creation order. Appended inside the existing per-registration lock;
         # no new lock on the resolution path.
@@ -827,7 +1011,8 @@ class Container:
         """Replace the process-wide default container explicitly."""
 
         with cls._provider_lock:
-            cls._instance = container
+            retired, cls._instance = cls._instance, container
+        del retired  # after the lock: the old container's objects may run their __del__
 
     @property
     def current_scope(self) -> Optional[_ScopeState]:
@@ -873,7 +1058,7 @@ class Container:
                 )
             self._open_generics[service_type] = (implementation_type or service_type, scope)
             # Re-registration must not leave closed types built from the old one.
-            for closed in [c for c in self._closed_generics if get_origin(c) is service_type]:
+            for closed in [c for c in self._closed_generics.copy() if get_origin(c) is service_type]:
                 del self._closed_generics[closed]
             self.registration_history.append(("open-generic", service_type))
 
@@ -896,8 +1081,9 @@ class Container:
             registration.typevar_map = dict(zip(parameters, args))
         if not cache:
             return registration
-        with self._registration_lock:
-            return self._closed_generics.setdefault(service_type, registration)
+        # No registration lock: a resolution may hold a creation lock here. setdefault is atomic;
+        # the two readers that iterate the dict iterate a copy.
+        return self._closed_generics.setdefault(service_type, registration)
 
     def set_implementation_selector(
         self, service_type: Type[Any], selector: Callable[[], Type[Any]]
@@ -966,6 +1152,7 @@ class Container:
         self, registration: ServiceRegistration, *, policy: str = "register"
     ) -> bool:
         service_type = registration.service_type
+        retired: list = []  # replaced registrations: let go after the lock (a last reference runs __del__)
         with self._registration_lock:
             exists = service_type in self.registrations
             if policy == "fallback" and exists:
@@ -980,18 +1167,25 @@ class Container:
                     f"Service is already registered: {service_type.__name__}; use replace()"
                 )
             if policy == "replace":
-                self._earlier.pop(service_type, None)
+                retired.append(self._earlier.pop(service_type, None))
                 # An alias shares a registration of the replaced type: it moves along
                 # (a test replacing a service must not leave the old one behind an alias).
                 for key, previous in list(self.registrations.items()):
                     if previous.service_type is service_type:  # the type itself is set just below
+                        retired.append(previous)
                         self.registrations[key] = registration
-            elif exists:
+            elif exists:  # the one written over is kept as earlier, or holds no object of the user
                 self._keep_earlier(self.registrations[service_type], registration)
             self.registrations[service_type] = registration
-            self._changes += 1
+            self._count_change()
             self.registration_history.append((policy, service_type))
-            return True
+        del retired
+        return True
+
+    def _count_change(self) -> None:
+        """The registrations changed: the active name map follows (see _change_lock)."""
+        with self._change_lock:
+            self._changes += 1
 
     def _keep_earlier(self, previous: ServiceRegistration, registration: ServiceRegistration) -> None:
         """Keep the registration being taken over, like .NET keeps every Add*.
@@ -1112,9 +1306,11 @@ class Container:
                 raise DuplicateServiceRegistrationError(
                     f"Service is already registered: {alias_type.__name__}"
                 )
+            retired = self.registrations.get(alias_type)  # let go after the lock (its __del__)
             self.registrations[alias_type] = registration
-            self._changes += 1
+            self._count_change()
             self.registration_history.append(("alias", alias_type))
+        del retired
 
     def register_factory(
         self,
@@ -1166,6 +1362,8 @@ class Container:
                 registration.implementation_type = self._discovered_implementation(
                     registration.service_type, defer=True
                 )
+                if registration.implementation_type is not None:
+                    self._count_change()  # changed in place: the active name map follows
                 earlier = self._earlier.get(registration.service_type)
                 if earlier and self.registrations.get(registration.service_type) is registration:
                     kept = [item for item in earlier if not _same_target(item, registration)]
@@ -1191,7 +1389,7 @@ class Container:
             registrations = (
                 *self.registrations.values(),
                 *self._keyed.values(),
-                *self._closed_generics.values(),
+                *self._closed_generics.copy().values(),
                 *(item for items in self._earlier.values() for item in items),
             )
             for registration in registrations:
@@ -1348,6 +1546,7 @@ class Container:
         me = threading.get_ident()
         if registration.lock.acquire(blocking=False):
             self._note_owner(registration, me)
+            _hold()
             return
         with _WAIT_LOCK:
             _WAITING[me] = registration
@@ -1356,6 +1555,7 @@ class Container:
             while True:
                 if registration.lock.acquire(timeout=0.05):
                     self._note_owner(registration, me)
+                    _hold()
                     return
                 if not warned and time.monotonic() - started >= self.creation_wait_warning:
                     warned = True
@@ -1388,26 +1588,20 @@ class Container:
         me = threading.get_ident()
         with _WAIT_LOCK:  # update ownership BEFORE releasing: never a stale owner
             owner = _LOCK_OWNERS.get(id(registration))
-            if owner is not None and owner[0] == me:
+            mine = owner is not None and owner[0] == me  # this thread noted it: it counts as held
+            if mine:
                 if owner[1] <= 1:
                     del _LOCK_OWNERS[id(registration)]
                 else:
                     _LOCK_OWNERS[id(registration)] = (me, owner[1] - 1)
         registration.lock.release()
+        if mine:
+            _unhold()
 
     def _resolve_registration(self, registration: ServiceRegistration) -> Any:
-        if (registration.instance is not _UNSET and registration.scope is LifetimeScope.SINGLETON
-                and not self._closed):
-            return registration.instance  # a ready singleton: no lock taken, nothing to warn about
-        _RESOLVING.depth = getattr(_RESOLVING, "depth", 0) + 1
-        try:
-            return self._resolve_registration_now(registration)
-        finally:
-            _RESOLVING.depth -= 1
-            if not _RESOLVING.depth:
-                _flush_warnings()  # every creation lock of this thread is released now
-
-    def _resolve_registration_now(self, registration: ServiceRegistration) -> Any:
+        instance = registration.instance  # read once: a host stop may clear it meanwhile
+        if instance is not _UNSET and registration.scope is LifetimeScope.SINGLETON and not self._closed:
+            return instance  # a ready singleton: no lock taken, nothing to warn about
         service_type = registration.service_type
         if self._closed:
             raise ContainerClosedError("The dependency container is closed")
@@ -1431,6 +1625,7 @@ class Container:
             if scope is None:
                 raise ScopeNotActiveError(
                     f"Scoped service requires an active scope: {service_type.__name__}"
+                    + _ThreadBirth.refusal_note()
                 )
             owner = _SINGLETON_IN_CREATION.get()
             if owner is not None:
@@ -1470,13 +1665,17 @@ class Container:
                     raise ResolutionError(f"Registration has no implementation: {service_type.__name__}")
                 # Interface registered before its implementation was imported.
                 implementation = self._discovered_implementation(service_type, defer=False)
+                # A plain store under no registration lock: a creation lock may be held here, and the
+                # library never takes the registration lock under one. The count's lock is a leaf.
                 registration.implementation_type = implementation
+                self._count_change()  # changed in place: the active name map follows
             # auto_inject fills these fields after construction, so a class that
             # only uses field injection must not have its __init__ resolved. One
             # that also takes constructor dependencies still gets them.
-            if getattr(implementation, "__di_attrs__", ()) and _accepts_no_arguments(
-                implementation
-            ):
+            own = getattr(implementation, "__di_own_attrs__", None)  # _field_injection_only, inline
+            if own is None:
+                own = getattr(implementation, "__di_attrs__", ())
+            if own and _accepts_no_arguments(implementation):
                 return implementation()
             signature = _init_signature(implementation)
             hints, extras, hint_error = _constructor_hints(implementation.__init__)
@@ -1583,6 +1782,7 @@ class Scope:
     def __enter__(self) -> "Scope":
         if self._token is not None:
             raise ScopeNotActiveError("A scope object cannot be entered twice")
+        self.state.thread = threading.current_thread()
         self._token = self.container._current_scope_var.set(self.state)
         return self
 
@@ -1625,3 +1825,209 @@ class Scope:
 
     def resolve_all(self, service_type: Type[T]) -> list[T]:
         return self.container.resolve_all(service_type)
+
+
+# ---------------------------------------------------------------------------------------------
+# Thread birth on the free-threaded build: no library context value is inherited.
+#
+# With sys.flags.thread_inherit_context (the default of the free-threaded 3.14 build) a new thread
+# starts with a copy of its starter's context. A pool worker born inside one request then keeps
+# that request's scope for its whole life and serves other requests from it - silently, another
+# request's objects. A thread's birth here leaves the library's own context values (every
+# ContextVar named "py_autowired...") out of that copy, so a thread sees what it sees on 3.11.
+# Context handed over explicitly (copy_context().run, asyncio.to_thread, anyio,
+# Thread(context=...)) is not touched, and neither is any other library's value.
+#
+# How: a sys.monitoring PY_START event local to threading.Thread.start's code object - only that
+# one function; the resolution path is unchanged. It is checked when installed (a probe thread must
+# not inherit a library value). If it cannot be set up, or fails later, nothing is left silent: a
+# hard rule reads a scope only in the thread that entered it - every other thread is refused,
+# explicit hand-overs (asyncio.to_thread, anyio) included - for the rest of the process. The
+# import-time case logs one WARNING; every refusal names the reason in its ScopeNotActiveError.
+# ---------------------------------------------------------------------------------------------
+
+def _fill_context(items) -> None:
+    for var, value in items:
+        var.set(value)
+
+
+class _ThreadBirth:
+    PREFIX = "py_autowired"
+    _TOOL_IDS = (4, 3)  # not reserved by Python (0 debugger, 1 coverage, 2 profiler, 5 optimizer)
+    _TOOL_NAME = "py_autowired thread birth"
+    SELF_TEST_TIMEOUT = 2.0  # seconds; the probe normally finishes in well under a millisecond
+    # The documented status: "active" (the hook is set and checked), "hard-rule" (it could not be,
+    # or failed later - one way, for the rest of the process), "not-needed" (threads do not inherit
+    # their starter's context on this build).
+    STATUS = "not-needed"
+    _decided = False
+    _tool = None
+    _original_current_scope = None
+    _lock = _LibraryLock()  # a fall-back and the installation's success never interleave
+
+    @staticmethod
+    def refusal_note() -> str:
+        if _ThreadBirth.STATUS != "hard-rule":
+            return ""
+        return (" (free-threaded build: py_autowired cannot stop new threads from inheriting its "
+                "context here - its thread-birth hook could not be set up or failed (STATUS="
+                "hard-rule) - so a scope is read only in the thread that entered it; explicit "
+                "hand-overs such as asyncio.to_thread and anyio are refused too. See Known limits)")
+
+    @staticmethod
+    def _clean_copy() -> contextvars.Context:
+        """A copy of the current context without the library's values."""
+        current = contextvars.copy_context()
+        keep = [(var, value) for var, value in current.items()
+                if not var.name.startswith(_ThreadBirth.PREFIX)]
+        if len(keep) == len(current):
+            return current
+        clean = contextvars.Context()
+        clean.run(_fill_context, keep)
+        return clean
+
+    @staticmethod
+    def _on_thread_start(code, instruction_offset) -> None:
+        # Runs in the starting thread at the top of Thread.start(), before the inherited copy is made.
+        try:
+            thread = sys._getframe(1).f_locals.get("self")
+            if isinstance(thread, threading.Thread) and thread._context is None:
+                thread._context = _ThreadBirth._clean_copy()  # no context= given: the cleaned copy
+        except Exception:  # never breaks the start, never logs here (a lock may be held): this
+            try:          # thread may inherit a scope, so the hard rule takes over for good
+                _ThreadBirth._go_hard()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _self_test() -> bool:
+        """A probe thread must not see a library value and must still see any other value."""
+        library = contextvars.ContextVar(_ThreadBirth.PREFIX + "_self_test", default=None)
+        other = contextvars.ContextVar("thread_birth_self_test", default=None)
+        seen: Dict[str, Any] = {}
+
+        def body() -> None:
+            library.set("set")
+            other.set("set")
+            probe = threading.Thread(target=lambda: seen.update(library=library.get(), other=other.get()),
+                                     name="py_autowired thread-birth self-test", daemon=True)
+            probe.start()
+            probe.join(_ThreadBirth.SELF_TEST_TIMEOUT)  # one that never runs leaves "seen" empty: failed
+        contextvars.Context().run(body)  # cannot start a thread now: _install catches it
+        return seen == {"library": None, "other": "set"}
+
+    @staticmethod
+    def _hard_current_scope(container: "Container") -> Optional[_ScopeState]:
+        """The hard rule's scope read: a scope is read only in the thread that entered it."""
+        state = container._current_scope_var.get()
+        if state is None or state.thread is threading.current_thread():
+            return state
+        return None  # the refused read names the reason in its ScopeNotActiveError
+
+    @staticmethod
+    def _apply_hard_rule() -> None:
+        if _ThreadBirth._original_current_scope is None:
+            _ThreadBirth._original_current_scope = Container.current_scope
+        Container.current_scope = property(_ThreadBirth._hard_current_scope)  # type: ignore[assignment]
+
+    @staticmethod
+    def _restore_scope_read() -> None:
+        if _ThreadBirth._original_current_scope is not None:
+            Container.current_scope = _ThreadBirth._original_current_scope  # type: ignore[assignment]
+            _ThreadBirth._original_current_scope = None
+
+    @staticmethod
+    def _go_hard() -> str:
+        """The hard rule, for the rest of the process (no way back)."""
+        with _ThreadBirth._lock:
+            _ThreadBirth._apply_hard_rule()
+            _ThreadBirth.STATUS = "hard-rule"
+            return _ThreadBirth.STATUS
+
+    _IMPORT_WARNING = (
+        "py_autowired could not set up its thread-birth hook on this free-threaded build (no free "
+        "sys.monitoring tool id among %s, the name is already taken by another copy, or its check "
+        "failed): STATUS=hard-rule - a scope is read only in the thread that entered it, explicit "
+        "hand-overs (asyncio.to_thread, anyio) are refused too, for the rest of the process. See "
+        "Known limits")
+
+    @staticmethod
+    def _install() -> str:
+        """Decided once, when the package is imported; returns the status. Never raises."""
+        if not getattr(sys.flags, "thread_inherit_context", 0):
+            _ThreadBirth.STATUS = "not-needed"
+            return _ThreadBirth.STATUS
+        if _ThreadBirth._decided:
+            return _ThreadBirth.STATUS
+        _ThreadBirth._decided = True
+        _ThreadBirth._apply_hard_rule()  # until the hook is set and checked
+        try:
+            monitoring = sys.monitoring
+            # The name already held (another copy of the library, or foreign code): not ours.
+            if not any(monitoring.get_tool(tool) == _ThreadBirth._TOOL_NAME for tool in range(6)):
+                for candidate in _ThreadBirth._TOOL_IDS:
+                    if monitoring.get_tool(candidate) is not None:
+                        continue
+                    try:
+                        monitoring.use_tool_id(candidate, _ThreadBirth._TOOL_NAME)
+                    except ValueError:  # taken meanwhile
+                        continue
+                    _ThreadBirth._tool = candidate
+                    break
+            # Another copy took an id under the name at the same moment: whoever sees the other after
+            # taking its own id gives way (the later check always sees the earlier claim, so never
+            # two active; at worst both keep the hard rule).
+            if _ThreadBirth._tool is not None and any(
+                    monitoring.get_tool(tool) == _ThreadBirth._TOOL_NAME
+                    for tool in range(6) if tool != _ThreadBirth._tool):
+                _ThreadBirth._uninstall()
+            if _ThreadBirth._tool is not None:
+                tool = _ThreadBirth._tool
+                monitoring.register_callback(tool, monitoring.events.PY_START, _ThreadBirth._on_thread_start)
+                monitoring.set_local_events(tool, threading.Thread.start.__code__, monitoring.events.PY_START)
+                if _ThreadBirth._self_test():
+                    with _ThreadBirth._lock:
+                        if _ThreadBirth.STATUS != "hard-rule":
+                            _ThreadBirth._restore_scope_read()
+                            _ThreadBirth.STATUS = "active"
+                            return _ThreadBirth.STATUS
+                    # The hook failed meanwhile (another thread): a fall-back at import, said below.
+        except Exception:  # e.g. Thread.start wrapped by something without __code__
+            pass
+        _ThreadBirth._uninstall()
+        _ThreadBirth._go_hard()
+        try:  # at import no library lock is held: the one WARNING, written here (no thread, no queue)
+            logger.warning(_ThreadBirth._IMPORT_WARNING, list(_ThreadBirth._TOOL_IDS))
+        except Exception:  # the import never fails because of it; STATUS still says it
+            pass
+        return _ThreadBirth.STATUS
+
+    @staticmethod
+    def _uninstall() -> None:
+        """Remove the hook and give the tool id back (a failed installation; tests). Each step on
+        its own: one that fails never keeps the tool id."""
+        tool = _ThreadBirth._tool
+        if tool is None:
+            return
+        _ThreadBirth._tool = None
+        monitoring = sys.monitoring
+        try:
+            monitoring.set_local_events(tool, threading.Thread.start.__code__, 0)
+        except Exception:
+            pass
+        try:
+            monitoring.register_callback(tool, monitoring.events.PY_START, None)
+        except Exception:
+            pass
+        try:
+            monitoring.free_tool_id(tool)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _reset_for_tests() -> None:
+        """Tests only: forget the decision (the library itself never installs twice)."""
+        _ThreadBirth._uninstall()
+        _ThreadBirth._restore_scope_read()
+        _ThreadBirth._decided = False
+        _ThreadBirth.STATUS = "not-needed"

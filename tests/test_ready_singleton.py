@@ -26,7 +26,10 @@ class Counting:
 
 
 class DepthWatch:
-    """Stands in for the thread-local resolution depth and records every write."""
+    """Stands in for the thread's held-locks count and records every write."""
+
+    count = 0  # the real state's per-thread defaults
+    pending = None
 
     def __init__(self):
         self.__dict__["writes"] = []
@@ -43,11 +46,11 @@ def test_a_ready_singleton_skips_the_resolution_bookkeeping(monkeypatch):
     flush = Counting(container_module._flush_warnings)
     depth = DepthWatch()
     monkeypatch.setattr(container_module, "_flush_warnings", flush)
-    monkeypatch.setattr(container_module, "_RESOLVING", depth)
+    monkeypatch.setattr(container_module, "_HELD", depth)
     for _ in range(3):
         assert container.resolve(Clock) is first
     assert flush.calls == 0, "a ready singleton flushed the deferred warnings"
-    assert depth.writes == [], "a ready singleton changed the resolution depth"
+    assert depth.writes == [], "a ready singleton took a library lock"
 
 
 def test_a_supplied_instance_is_ready_too(monkeypatch):
@@ -60,25 +63,58 @@ def test_a_supplied_instance_is_ready_too(monkeypatch):
     assert flush.calls == 0
 
 
-def test_a_singleton_not_created_yet_still_does_the_bookkeeping(monkeypatch):
+def test_a_singleton_not_created_yet_holds_its_creation_lock(monkeypatch):
+    """Round 19 (P1): the bookkeeping is the count of library locks held - a singleton's creation
+    lock counts while it is held, and only then."""
     container = Container()
     container.register_singleton(Clock)
-    flush = Counting(container_module._flush_warnings)
-    monkeypatch.setattr(container_module, "_flush_warnings", flush)
+    depth = DepthWatch()
+    monkeypatch.setattr(container_module, "_HELD", depth)
     container.resolve(Clock)
-    assert flush.calls == 1
+    assert depth.writes == [("count", 1), ("count", 0)]
 
 
-@pytest.mark.parametrize("scope", [LifetimeScope.TRANSIENT, LifetimeScope.SCOPED])
-def test_other_lifetimes_still_do_the_bookkeeping(monkeypatch, scope):
+def test_a_transient_takes_no_library_lock(monkeypatch):
+    """Round 19 (P1): a transient takes no library lock, so it pays no bookkeeping (it was the
+    largest part of injected()'s slowdown against 0.5.3)."""
     container = Container()
-    container.register(Clock, Clock, scope)
-    flush = Counting(container_module._flush_warnings)
-    monkeypatch.setattr(container_module, "_flush_warnings", flush)
+    container.register_transient(Clock)
+    depth = DepthWatch()
+    monkeypatch.setattr(container_module, "_HELD", depth)
+    container.resolve(Clock)
+    container.resolve(Clock)
+    assert depth.writes == []
+
+
+def test_a_scoped_creation_counts_its_locks_and_ends_at_zero(monkeypatch):
+    container = Container()
+    container.register_scoped(Clock)
     with container.create_scope():
+        depth = DepthWatch()
+        monkeypatch.setattr(container_module, "_HELD", depth)
         container.resolve(Clock)
-        container.resolve(Clock)
-    assert flush.calls == 2
+        container.resolve(Clock)  # already created in this scope: no lock
+    counts = [value for name, value in depth.writes if name == "count"]
+    assert counts and max(counts) >= 1 and counts[-1] == 0, depth.writes
+
+
+def test_a_deferred_warning_is_still_flushed(monkeypatch, caplog):
+    """Round 19 (speed): a WARNING raised during a creation is written once the outermost
+    resolution ends - the flush runs whenever something is pending."""
+    import logging
+
+    monkeypatch.setattr(container_module, "_WARNED", set())
+
+    class Noisy:
+        def __init__(self):
+            container_module._warn_once(("noisy-test",), "noisy %s", "created")
+
+    container = Container()
+    container.register_transient(Noisy)
+    with caplog.at_level(logging.WARNING, logger="py_autowired"):
+        container.resolve(Noisy)
+    assert [r.getMessage() for r in caplog.records if r.getMessage() == "noisy created"] == ["noisy created"]
+    assert not container_module._HELD.pending
 
 
 def test_a_closed_container_still_refuses_a_ready_singleton():
@@ -135,3 +171,33 @@ def test_only_a_singleton_answers_with_its_stored_instance():
         service_type=Clock, implementation_type=Clock, scope=LifetimeScope.TRANSIENT, instance=stored)
     made = container.resolve(Clock)
     assert made is not stored and type(made) is Clock, "a transient answered with a stored instance"
+
+
+def test_a_ready_singleton_detached_between_two_reads_never_answers_with_the_empty_marker():
+    """Review round 7: the early return read the stored instance twice. When the host stopped
+    (_detach_created_singletons) between the two reads, the caller got the library's empty
+    marker instead of an object."""
+    from py_autowired import ServiceRegistration
+
+    container = Container()
+    container.register_singleton(Clock)
+    first = container.resolve(Clock)
+    box = {"armed": True}
+
+    class Racing(ServiceRegistration):
+        @property
+        def instance(self):
+            value = self.__dict__["instance"]
+            if box["armed"] and value is not container_module._UNSET:
+                box["armed"] = False
+                container._detach_created_singletons()  # the host stops right after this read
+            return value
+
+        @instance.setter
+        def instance(self, value):
+            self.__dict__["instance"] = value
+
+    container.registrations[Clock].__class__ = Racing
+    got = container.resolve(Clock)
+    assert got is not container_module._UNSET, "the caller got the empty marker"
+    assert isinstance(got, Clock)

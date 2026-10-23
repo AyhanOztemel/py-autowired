@@ -7,7 +7,8 @@ default any more: each one is a WARNING, an ERROR or a validation issue - shown
 when the application configures `logging`; validation covers the graph the
 `*_instance` fields reach. Many are made visible rather than prevented (see
 "Known limits" in the README); "Coming in 0.6.0" lists those that will become
-errors. Nothing is removed; what gets injected does not change.
+errors. Nothing is removed; what gets injected changes only where "Behaviour
+changes" says so.
 
 ### Added
 
@@ -162,7 +163,10 @@ inject the wrong thing or nothing):
   project root, or created after startup) fills the `None` fields of the object
   it builds, after `__init__` returns. The class itself is not changed (modules
   outside the project are never touched), so `__init__` cannot use those fields
-  yet. A field with no registration is a WARNING, as everywhere.
+  yet. A field with no registration is a WARNING, as everywhere. A registered
+  type whose class was never patched is not filled this way (a shared singleton
+  would keep the first request's objects); its `None` fields used to stay
+  `None` silently and now each gets a WARNING naming it.
 - A `__signature__` that cannot be read is rebuilt from the function's code
   (`functools.wraps` wrappers included): the container passes the right
   arguments, and validation checks the real parameters - also of a
@@ -238,7 +242,36 @@ pinned by a test that failed before:
   `refresh()` was called: `resolve()` already gave the new implementation while
   a patched class's field silently still got the old one (since 0.5.3). The
   active name map now rebuilds itself when the registrations change; an
-  unchanged container never rebuilds it, and the lookup takes no lock.
+  unchanged container never rebuilds it, and the lookup takes no lock. The old
+  map is let go after the rebuild's lock: a `__del__` it triggers (a replaced
+  factory, say) may look names up again without hanging. The same holds for
+  `replace()`, `register_alias()`, a closing scope and `Container.set_default()`:
+  what they let go is released after their lock, so no `__del__` runs under a
+  library lock (one that resolved a singleton another thread was creating
+  could hang both threads).
+- A closing scope could hand out an object that was already disposed (a
+  finalizer resolving a sibling finalized before it, or work a finalizer had
+  started), and could hand its live objects to code that was not closing it
+  (another thread or task holding an earlier copy of the context). Now the
+  objects leave the lock-free path when the close starts, each one leaves the
+  scope before its finalizer runs, and only the closing code (and what it
+  passes its context to) still gets the ones not finalized yet; everyone else
+  gets `ScopeNotActiveError`. The lock-free path of a live scope is unchanged.
+- On the free-threaded 3.14 build a new thread inherits its starter's context,
+  so a pool worker born inside one request kept that request's scope and served
+  other requests from it - another request's session, silently. A thread's
+  birth now leaves the library's own context values out (a `sys.monitoring`
+  event local to `threading.Thread.start`; checked when installed). If it
+  cannot be used, or fails later, a hard rule holds for the rest of the process
+  (a scope is read only in the thread that entered it; one WARNING at import, the
+  reason in every refusal's message afterwards; `_thread_birth.STATUS`).
+  Behaviour change on that build only: a plain `threading.Thread` child of a
+  request no longer sees the request's scope, as on 3.11 - pass the context
+  explicitly to share it.
+- The library's own source imported a second time under another name (by
+  discovery) installed that thread hook a second time; it is installed once,
+  and the second copy uses the hard rule for its own containers - also when
+  both copies install at the same moment (never two hooks).
 - `replace()` moves the aliases of the replaced type along (also a chain of
   aliases, and an alias of an earlier registration of that type). An alias
   used to keep the old registration, so a test that replaced a service with a
@@ -312,6 +345,42 @@ Each changed test pinned a defect, not a contract:
 - `test_a_real_import_failure_found_later_is_a_warning_once`: the WARNING came
   at once -> the background writer writes it a moment later (still exactly
   once); the test waits for it.
+- (new tests) A project class inheriting a `*_instance` field from a base
+  OUTSIDE the project (set in the base's `__init__`, its class body, a mixin
+  method or another method of the base): the field was never a candidate - the
+  class was not patched, a registered field stayed `None` and an unregistered
+  one said nothing, `validate=True` neither (since 0.4.0) -> such a base is read
+  with the rule of the class's own members (its body, `__slots__`, annotations,
+  and only the `self.` assignments in its methods); a registered field is
+  filled, an unregistered one is a WARNING and a validation issue. The base
+  itself is never patched. **What may change for working code:** an attribute
+  a base outside the project keeps for itself under a `*_instance` name is now
+  filled when a registration matches its name (only then). To keep it as it
+  is, give it a value before the field is read, or rename the registration.
+  Its plain methods are read for assignments on `self` (also a `self` a
+  closure captures); in its static and class methods every `*_instance`
+  assignment counts; an assignment whose object the scan cannot name counts -
+  in doubt a field is reported (a WARNING, a validation issue), never lost. A
+  base field or a base's annotation never makes the class a "field injection
+  only" class: its constructor dependencies are still resolved (two first
+  versions of this change left `__init__(self, dep: Dep = None)` with `None`;
+  fixed before release). Before 0.5.4 a base's annotation alone already made
+  the class skip its constructor dependencies; it no longer does.
+- (no test changed) `injected()` was slower than in 0.5.3 - measured per
+  commit: +95% for a registered singleton, +37% for a transient after the first
+  0.5.4 step, and a cache decorator misplaced during the review (+130% for a
+  transient, fixed before release). Now, against 0.5.3 (3.11, the dependency
+  alone): singleton about +10%, transient about +9%, unregistered controller
+  about +6%; see "Known limits" for what the rest costs and why it is kept.
+- `test_a_singleton_not_created_yet_still_does_the_bookkeeping` and
+  `test_other_lifetimes_still_do_the_bookkeeping`: every resolution counted a
+  "resolution depth" to keep WARNINGs until creation locks were released ->
+  the count is the library locks this thread holds (any of them: creation,
+  library, registration, provider, scope, name map, thread birth, startup), so
+  a WARNING raised under the library lock is kept too; a resolution that takes
+  no lock (a transient) writes its WARNING at once instead of at the end of the
+  resolution, and pays no bookkeeping (it was the largest part of injected()'s
+  slowdown against 0.5.3).
 
 Tests of 0.5.3 that the earlier 0.5.4 changes above also changed: the skip
 message now ends with "it is checked when it loads"; a read-only property is

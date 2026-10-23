@@ -384,11 +384,14 @@ def test_ikinci():
 **Neden:** bazı uç noktalarda FastAPI'nin `Depends` yapısını tercih ediyorsunuz.
 **Kullanımı:** `controller=Depends(injected(ProductController))`; `injected`
 `py_autowired.fastapi` içinden gelir. Nesnenin alanları aynı şekilde dolar.
-Taramanın hiç yamalamadığı bir sınıf (proje kökü dışında ya da açılıştan sonra
-oluşturulmuş) değiştirilmez: `injected()` kurduğu nesnenin `None` kalan
-alanlarını `__init__` bittikten sonra doldurur; bu yüzden `__init__`'in kendisi
-o alanları henüz kullanamaz. `__init__` alanlarına ihtiyaç duyuyorsa sınıfı
-projeye taşıyın.
+Taramanın hiç yamalamadığı kayıtsız bir sınıf (proje kökü dışında ya da
+açılıştan sonra oluşturulmuş) değiştirilmez: `injected()` kurduğu nesnenin
+`None` kalan alanlarını `__init__` bittikten sonra doldurur; bu yüzden
+`__init__`'in kendisi o alanları henüz kullanamaz. `__init__` alanlarına
+ihtiyaç duyuyorsa sınıfı projeye taşıyın. Sınıfı yamalanmamış **kayıtlı** bir
+türü ise `injected()` doldurmaz (paylaşılan bir singleton ilk isteğin
+nesnelerini tutardı): `None` kalan her alan, adını veren bir WARNING ile `None`
+kalır - sınıfı proje kökü içine alın ya da yapıcı enjeksiyonu kullanın.
 
 ### Log ve hata ayıklama çıktısı
 
@@ -547,22 +550,107 @@ bir satırda adıyla bildirir.
   kütüphane meşgulken oluşturulan sınıf alanlarını kütüphane boşalınca alır; tür
   ipuçları çözülemeyen, varsayılanı olan `Keyed` parametre varsayılanı alır.
   Hata olacakları "0.6.0'da gelecek" listeler.
-- **Süreç başına bir container** (bkz. Notlar). Denetim istek başlarken yapılır:
-  istek sürerken etkinleştirilen bir container ve istek DIŞINDA (betik, arka plan
-  thread'i) kurulan nesneler yakalanmaz - etkin container'ı kullanırlar (0.6.0:
-  istek başına container). Hiç etkin container yokken (henüz hiçbir uygulama
-  açılmamış, ör. yalnız `with` olmadan `TestClient`) bulunamayan alanlar
-  0.5.3'teki gibi `None` kalır ve WARNING verilir. İkisini karıştırmak çalışmaz:
+- **Aynı süreçte birden çok uygulama: DESTEKLENMİYOR, 0.5.4'te çözülmedi.** Alan
+  enjeksiyonu süreç geneli tek bir etkin container kullanır. İstek başında yapılan
+  denetim en iyi çaba ile yapılan bir yakalamadır: istek sürerken etkinleştirilen
+  bir container ve istek DIŞINDA (betik, arka plan thread'i) kurulan nesneler
+  yakalanmaz - etkin container'ı kullanırlar. Kütüphanenin görmediği bir
+  thread'de (bağlamı devretmeden başlattığınız) nesnenin hangi uygulamaya ait
+  olduğunu süreç içinde hiçbir şey söylemez; bu orada hiç çözülemez. 0.5.5 birden
+  çok canlı container için bir yönlendirici, 0.6.0 hiçbir bağlam olmadan kurulan
+  nesne için açık hata getirecek. Hiç etkin container yokken (henüz hiçbir uygulama
+  açılmamış, ör. yalnız `with` olmadan `TestClient`) alanlar 0.5.3'teki gibi
+  doldurulmaz: her biri, adını veren bir WARNING ile `None` kalır. İkisini karıştırmak çalışmaz:
   `with` ile açılan bir uygulama durduktan sonra container'ı etkin kalır, bu
   yüzden `with` olmadan kullanılan başka bir uygulamanın her isteği hata verir -
   her uygulamayı `with` ile açın ya da önce `activate_container(container)`
   çağırın.
+- **Kapanan bir scope** nesnelerini yalnız onu kapatan koda verir (sonlandırıcıları
+  ve onların bağlam kopyasıyla başlattıkları), o da yalnız sonlandırıcısı henüz
+  çalışmamış olanları; başka herkes `ScopeNotActiveError` alır. Scope kapanmadan
+  ÖNCE elinize aldığınız nesne, tuttuğu şeyle çalışmaya devam eder - sonlandırıcısı
+  kapattığı bir kaynağı kullanması engellenmez.
+- **GIL'siz 3.14'te thread'ler:** yeni bir thread artık kütüphanenin bağlamını
+  (başka bir isteğin scope'unu) miras almaz. Bu yüzden bir istek içinde başlatılan
+  düz `threading.Thread`, 3.11'deki gibi isteğin scope'unu görmez; devretmek için
+  `threading.Thread(..., context=contextvars.copy_context())` ya da
+  `asyncio.to_thread` kullanın. Bunun için bir `sys.monitoring` araç kimliği
+  (4; doluysa 3) kullanılır; tam bu kimlikleri isteyen bir araç onunla çakışır.
+  Boş kimlik yoksa, import'taki denetimi başarısız olursa ya da kanca sonradan
+  hata verirse kütüphane süreç sonuna kadar sert kurala geçer: scope yalnız ona
+  giren thread'de okunur; başka her thread - `asyncio.to_thread` ve FastAPI'nin
+  senkron uçlarının kullandığı anyio işçileri dahil - `ScopeNotActiveError` alır,
+  başka bir isteğin nesnelerini asla. Import'taki düşüş bir WARNING yazar;
+  sonradan olan düşüş log yazmaz (kanca bir kilit altında çalışıyor olabilir),
+  nedeni her reddin `ScopeNotActiveError` mesajında yazar (`STATUS=hard-rule`).
+  Durum `py_autowired._thread_birth.STATUS` ile okunur: `"active"`, `"hard-rule"`
+  ya da `"not-needed"` (bu yapıda thread'ler miras almaz). Süreci yeniden
+  başlatmadan geri dönüş yoktur. Aynı süreçte paketin ikinci bir kopyası
+  yüklenirse (kütüphanenin kaynağı başka bir adla yeniden import edilirse) o
+  kopya kendi container'ları için hep sert kuralı kullanır - ilk kopya import'ta
+  düşmüş ve araç kimlikleri sonradan boşalmışsa hariç: o zaman yeni kopya kendi
+  kancasını kurup kendisi için `"active"` olabilir (ilk kopya sert kuralda kalır).
 - **Factory içinde kapatılan scope** (kendi scope'unu açıp kapatan bir factory)
   temizleyicilerini factory'nin oluşturma kilidi tutulurken çalıştırır.
   Kütüphanenin kendi kapanışı bunu asla yapmaz: kapatan thread o scope'taki bir
   oluşturmanın beklediği bir kilidi tutuyorsa hiçbir şey kapatılmaz, scope açık
   kalır ve `CircularDependencyError` verilir - kilit bırakıldıktan sonra yeniden
   kapatın.
+- **Sınıfı yamalanmamış kayıtlı tür**, `None` alanlar için yalnız düz değerler
+  okunarak denetlenir (kendi düz sözlüğü, düz sınıf değerleri, slotlar); nesnenin
+  ya da sınıfın hiçbir kodu çalışmaz. Bu mümkün değilse (sınıf kendi `__dict__`'ini
+  tanımlıyor, nesnenin `__dict__`'i bir `dict` alt sınıfı, bir sözlükte düz metin
+  olmayan bir anahtar var ya da alana benzeyen bir
+  ad property veya başka bir tanımlayıcı) sınıf başına bir WARNING, alanlarının
+  denetlenemediğini söyler.
+- **Anahtarında metin olmayan bir `__module__` ya da `__qualname__` bulunan tek
+  seferlik WARNING** (kullanıcı kodu öyle atadıysa) bir kez değil her seferinde
+  yazılır: kütüphane böyle bir nesneyi asla tutmaz ve hash'lemez.
+- **Kütüphane kilidi altında çalışan kod:** keşif sırasında proje modüllerinin
+  import'u ve kayıtlı türlerle anahtarların `__hash__`/`__eq__`'i kütüphane
+  kilidi tutulurken çalışır. Bunlar, aynı container'dan çözen başka bir
+  thread'i beklememeli (10 sn sonra iki thread'i de adlandıran bir WARNING).
+  Kütüphanenin bıraktığı bir nesnenin (ör. eski isim haritasının kayıtları)
+  `__del__`'i bir singleton oluşturulurken çalışabilir: `__del__` içinde
+  container'dan çözmeyin, başka bir thread'i beklemeyin.
+- **Proje dışındaki bir tabandan miras gelen alan** tabanın sınıf
+  gövdesinden, `__slots__`'undan, ek açıklamalarından ve düz metotlarının `self`
+  üzerine yaptığı atamalardan okunur (bir iç fonksiyonun yakaladığı `self` de).
+  Statik ve sınıf metotlarında, hedef nesne ne olursa olsun her `*_instance`
+  ataması sayılır (onlara `self` verilebilir): başka bir nesnenin alanı da
+  bildirilebilir - görünür bir WARNING ya da doğrulama sorunu, asla sessiz `None`.
+  Nesnesi adlandırılamayan bir atama (bir çağrının sonucu) sayılır - şüphede alan
+  bildirilir, kaybolmaz; başka bir adla (`alias = self; alias.x_instance = ...`)
+  ya da hesaplanan adla (`setattr`) yapılan atama görülmez. Böyle bir alan - ya da
+  herhangi bir tabanın ek açıklaması - sınıfı "yalnız alan enjeksiyonu kullanan"
+  sınıf yapmaz: kurucu bağımlılıkları eskisi gibi çözülür. Böyle bir tabanın kendine ait `*_instance` adlı özniteliği, adına
+  uyan bir kayıt varsa doldurulur (bkz. CHANGELOG, "Behaviour changes"). Bir kez
+  okunan taban yeniden okunmaz: sonradan ona eklenen metoda bakılmaz. Hangi
+  atamanın `self` üzerine yapıldığı bayt kodundan okunur; bu okuma süreç başına
+  bir kez bilinen şekillerle sınanır (3.10, 3.11, 3.14, 3.14t'de sınandı). Sınama
+  tutmayan bir Python'da bir WARNING bunu söyler ve her atama sayılır (başka bir
+  nesnenin alanı da bildirilebilir, hiçbiri kaybolmaz). Bir taban, dosyası
+  süreçteki herhangi bir `auto_inject()` çağrısının kökü altındaysa proje içi
+  sayılır: farklı köklerle yapılan çağrılardan sonra önceki bir kökün altındaki
+  taban okunmaz (alanı, 0.5.4 öncesindeki gibi aday olmaz).
+- **`injected()` hızı, 0.5.3'e göre** (CPython 3.11, Windows, bağımlılığın
+  kendisinin tek çağrısı, ağ yok, sıcak önbellek): kayıtlı singleton yaklaşık
+  +%10 (~110 ns), kayıtlı transient yaklaşık +%9 (~490 ns), kayıtsız denetleyici
+  yaklaşık +%6 (~270 ns). Bilerek ödenen bedel: isteğin konteynerinin etkin
+  konteyner olduğu denetimi (her bağımlılıkta da; WebSocket ya da ara katman
+  dışı bir bağımlılık için tek denetim), kayıtlı türün alan denetimi (sınıfının
+  yamalı olduğu bilindikten sonra tek kimlik karşılaştırması) ve ortak alan
+  döngüsü. Gerçek bir istekte (yönlendirme, ara katman, scope) bu yüzde birin
+  altındadır; yayın ikisini de ölçer.
+- **Log kaydının ne zaman yazıldığı:** bir iş parçacığı kütüphane kilidi
+  tutarken (oluşturma kilidi, kütüphane kilidi, kayıt, sağlayıcı, scope, ad
+  haritası, thread doğumu ya da başlangıç kilidi) kütüphanenin her kaydı (her
+  düzey) bekletilir ve son kilidi bıraktığında yazılır - bir log işleyicisi kendi
+  kilitlerini alabilir. Kilit almayan bir çözümleme (transient) hemen yazar. Bu
+  yüzden arka plandaki bir iş parçacığının kaydı, o kilidi bıraktıktan bir an
+  sonra görünebilir.
+- **Kayıttan sonra değişen sınıf bilgisi** (örneğin kayıtlı sınıfın `__name__`'i)
+  isim haritasınca kendiliğinden görülmez - `refresh()` çağırın.
 - *(0.5.4'te çözüldü)* Eski changelog'lardaki iki sınır artık geçerli değil:
   `replace()` değiştirilen türün alias'larını da yeni kayda taşır; kalıtılan
   `__init__` içinde açıklamasız atanan alanlar enjekte edilir.

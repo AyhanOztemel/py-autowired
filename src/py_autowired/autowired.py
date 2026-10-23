@@ -3,6 +3,7 @@ Automatic field injection with cached name matching and nested module scanning.
 """
 import re
 import inspect
+import types
 import sys
 import importlib
 import importlib.abc
@@ -21,7 +22,8 @@ from typing import Dict, Iterable, List, Optional, Any, Tuple, TypeVar
 
 from .container import (
     _BACKGROUND_LOG, DependencyInjectionError, Lazy, LifetimeScope, _WARNED, _constructor_hints,
-    _deferred_wrapper, _init_signature, _keyed_marker, _parameter_hint, _signature_of, _slot_name,
+    _HeldLogger, _LibraryLock, _deferred_wrapper, _field_injection_only, _hold, _init_signature, _keyed_marker,
+    _unhold, _parameter_hint, _signature_of, _slot_name,
     _unsupported_keyed,
     _unwrap_annotation, _warn_once, _warn_once_background,
 )
@@ -30,7 +32,7 @@ from .container import (
 # CONFIGURATION
 # ============================================================================
 DEBUG_MODE = os.getenv("PY_AUTOWIRED_DEBUG", os.getenv("DI_DEBUG", "")).lower() in ("1", "true", "yes")
-logger = logging.getLogger("py_autowired")
+logger = _HeldLogger(logging.getLogger("py_autowired"))  # kept while a library lock is held
 # Only debug mode installs console output. Applications otherwise own logging.
 if not any(getattr(handler, "_py_autowired_handler", False) for handler in logger.handlers):
     handler = logging.StreamHandler() if DEBUG_MODE else logging.NullHandler()
@@ -70,6 +72,7 @@ class _GlobalLock:
         self._lock = threading.RLock()
         self._owner: Optional[int] = None
         self._depth = 0
+        self._kept = threading.local()  # what let_go() keeps, per thread, until the lock is free
 
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
         if not blocking or timeout >= 0:
@@ -79,6 +82,7 @@ class _GlobalLock:
         if got:
             self._owner = threading.get_ident()
             self._depth += 1
+            _hold()
         return got
 
     def _wait(self) -> bool:
@@ -94,9 +98,20 @@ class _GlobalLock:
 
     def release(self) -> None:
         self._depth -= 1
-        if not self._depth:
+        outermost = not self._depth
+        if outermost:
             self._owner = None
         self._lock.release()
+        if outermost:
+            kept = self._kept.__dict__.pop("objects", None)
+            del kept  # after the lock: a __del__ that raises is reported by Python, the rest still go
+        _unhold()  # the last library lock released: the WARNINGs kept meanwhile are written
+
+    def let_go(self, obj: Any) -> None:
+        """Release ``obj`` only once this thread no longer holds the lock: its last reference may
+        run a user's __del__, which must not run under the library lock. Not held: nothing kept."""
+        if self._owner == threading.get_ident():
+            self._kept.__dict__.setdefault("objects", []).append(obj)
 
     def __enter__(self) -> bool:
         return self.acquire()
@@ -324,8 +339,8 @@ class _CachedNameMap:
         self._raw_map = None
         self._resolution_cache: Dict[Tuple[str, str], Any] = {}
         # 🆕 v2: nogil güvenliği — lazy init yarışını kapatan kilit
-        self._lock = threading.Lock()
-        # Bumped by every rebuild; lets lock-free lookups detect a concurrent one.
+        self._lock = _LibraryLock()
+        # Bumped by every rebuild (refresh() and a registration change both count).
         self._generation = 0
         # The container's change count the map was built from (None: not built yet).
         self._seen = None
@@ -337,27 +352,45 @@ class _CachedNameMap:
         """The name map: built once, and again when the registrations have changed."""
         # Double-checked locking: no lock on the hot path
         if self._stale():
+            built = retired = None
             with self._lock:
                 if self._stale():
-                    self._rebuild()
+                    built, retired = self._rebuild()
+            _GLOBAL_LOCK.let_go(retired)  # under the library lock: kept until that is free too
+            del retired  # after the lock: dropping the old map may run a user's __del__
+            if built is not None:
+                _log_name_map(built)  # after the lock: a log handler may inject fields itself
         return self._raw_map
 
     def _rebuild(self):
-        """Build the map and drop the cached choices (the caller holds self._lock)."""
+        """Build the map and drop the cached choices (the caller holds self._lock; no log
+        and no user code here). Returns the new map and the old map and choices: the caller
+        drops them after the lock (their last reference may run a user's __del__)."""
+        retired = (self._raw_map, self._resolution_cache)
         seen = getattr(self._container, "_changes", 0)  # read first: a change meanwhile rebuilds again
-        self._generation += 1  # first: a lookup storing an old choice from now on drops it
-        self._raw_map = _build_name_map_from_container(self._container)
-        self._resolution_cache.clear()
+        self._generation += 1
+        self._raw_map = _build_name_map_from_container(self._container, log=False)
+        # A NEW dict, after the new map: a lookup that took the old dict (with the old map) can only
+        # store its old choice there, where no lookup reads any more.
+        self._resolution_cache = {}
         self._seen = seen
+        return self._raw_map, retired
 
     def refresh(self):
         """🆕 v2: Geç kayıtlar için haritayı ve cache'i yeniden kur."""
         with self._lock:
-            self._rebuild()
+            built, retired = self._rebuild()
+        _GLOBAL_LOCK.let_go(retired)  # under the library lock: kept until that is free too
+        del retired  # after the lock: dropping the old map may run a user's __del__
+        _log_name_map(built)
 
     def get_cached_registration(self, normalized_name: str, context_module: str) -> Optional[Any]:
         """Get best registration with aggressive caching"""
-        if getattr(self._container, "_changes", 0) != self._seen:
+        try:  # read directly: getattr() with a default costs a call on every lookup
+            changed = self._container._changes != self._seen
+        except AttributeError:  # a container that counts no changes
+            changed = 0 != self._seen
+        if changed:
             self.get_raw_map()  # the registrations changed: never answer from the old choices
         cache_key = (normalized_name, context_module)
 
@@ -367,25 +400,21 @@ class _CachedNameMap:
         if cached is not _UNSET:
             return cached
 
-        # Cache miss - calculate and store (still lock-free). The generation is
-        # read BEFORE the map, so a refresh() during the computation is detected.
-        generation = self._generation
+        # Cache miss - calculate and store (still lock-free). The choices dict is taken BEFORE the
+        # map: a rebuild meanwhile gives the cache a new dict, so a choice made from the old map
+        # goes into the old dict only - it never reaches a later lookup.
+        choices = self._resolution_cache
         raw_map = self.get_raw_map()
         regs = raw_map.get(normalized_name, [])
         best = _pick_best_registration(regs, context_module) if regs else None
         # 🆕 v2: setdefault — eşzamanlı yazımda tek deterministik değer
-        stored = self._resolution_cache.setdefault(cache_key, best)
-        if self._generation != generation:
-            # A refresh() ran meanwhile: never let a pre-refresh choice persist.
-            if self._resolution_cache.get(cache_key) is best:
-                self._resolution_cache.pop(cache_key, None)
-            return best
-        return stored
+        return choices.setdefault(cache_key, best)
 
-def _build_name_map_from_container(container):
+def _build_name_map_from_container(container, log=True):
     """
     ORIGINAL FUNCTION - unchanged logic
-    Build name map from container registrations.
+    Build name map from container registrations. ``log=False``: the caller logs it
+    later, outside its lock.
     """
     name_map = defaultdict(list)
 
@@ -427,13 +456,17 @@ def _build_name_map_from_container(container):
             for key in {_norm(it.__name__), _generic_key(it.__name__)} - taken - {None}:
                 name_map[key].append(reg)
 
+    if log:
+        _log_name_map(name_map)
+    return name_map
+
+
+def _log_name_map(name_map) -> None:
     if DEBUG_MODE:
         logger.debug("Name map built:")
         for key, regs in name_map.items():
             types = [r.service_type.__name__ for r in regs]
             logger.debug(f"  {key!r} -> {types}")
-
-    return name_map
 
 
 def _registration_score(reg, ctx_module: str):
@@ -529,7 +562,13 @@ def _lookup_registration(container, name_map, normalized_name: str, context_modu
 # ============================================================================
 
 def _find_di_candidates(cls) -> tuple:
-    """
+    return _find_di_candidate_parts(cls)[0]
+
+
+def _find_di_candidate_parts(cls) -> tuple:
+    """(every candidate, the class's OWN candidates - steps 1-3, without the fields only a base
+    outside the project gives it).
+
     🆕 v2: Sınıfın '*_instance' DI adaylarını PATCH ANINDA bir kez tespit et.
     Kaynaklar:
       1. Sınıf gövdesindeki attribute'lar   (order_service_instance = None)
@@ -545,11 +584,14 @@ def _find_di_candidates(cls) -> tuple:
         if _DEF_ATTR_RE.match(name):
             candidates.add(name)
 
-    # 2) Annotation'lar (kalıtım dahil — __init__ super zinciriyle set edebilir)
+    # 2) Annotation'lar (kalıtım dahil — __init__ super zinciriyle set edebilir). A base's
+    #    annotation is a candidate, not one of the class's OWN (0.5.4 round 20): it never makes
+    #    the class a "field injection only" class.
+    inherited = set()
     for klass in cls.__mro__:
         for name in getattr(klass, "__annotations__", {}):
             if _DEF_ATTR_RE.match(name):
-                candidates.add(name)
+                (candidates if klass is cls else inherited).add(name)
 
     # 3) Kendi metodlarının co_names'i (self.x_instance = ... atamalarını yakalar)
     for member in cls.__dict__.values():
@@ -563,9 +605,157 @@ def _find_di_candidates(cls) -> tuple:
             if _DEF_ATTR_RE.match(instruction.argval):
                 candidates.add(instruction.argval)
 
+    # 4) Members inherited from bases OUTSIDE the project: such a base is never patched, so its
+    #    field would otherwise be no candidate anywhere and stay None without a word (0.5.4).
+    own = set(candidates)
+    candidates.update(inherited)
+    for base in _TYPE_MRO(cls)[1:]:
+        candidates.update(_outside_base_fields(base))
+
     # A method, property or other descriptor with a field-like name (for example
     # a ``has_instance`` property) is not a field: injection must not touch it.
-    return tuple(sorted(name for name in candidates if not _is_accessor(cls, name)))
+    every = tuple(sorted(name for name in candidates if not _is_accessor(cls, name)))
+    return every, tuple(name for name in every if name in own)
+
+
+_BASE_FIELDS: Dict[int, tuple] = {}  # id(base) -> (weak reference, its field names)
+
+
+def _outside_base_fields(base) -> frozenset:
+    """The *_instance names a class outside the project defines, read with the rule of a class's
+    own members: its body (fields, __slots__) and the ``self.`` assignments in its methods. Empty
+    for a project class (it is patched itself). Read once per class, from plain copies only: no
+    code of the base runs."""
+    cached = _BASE_FIELDS.get(id(base))
+    if cached is not None and cached[0]() is base:
+        return cached[1]
+    names = frozenset() if _in_project(base) else _read_outside_base(base)
+    try:
+        _BASE_FIELDS[id(base)] = (weakref.ref(base, _forget_base(id(base))), names)
+    except TypeError:
+        pass  # it cannot be weakly referenced: read again next time
+    return names
+
+
+def _forget_base(key: int):
+    def forget(ref) -> None:  # the class is gone: drop its entry
+        entry = _BASE_FIELDS.get(key)
+        if entry is not None and entry[0] is ref:
+            del _BASE_FIELDS[key]
+    return forget
+
+
+def _read_outside_base(base) -> frozenset:
+    snapshot = _plain_snapshot(_TYPE_DICT(base))
+    if snapshot is None:
+        # The library lock may be held here: a log handler never runs under it.
+        _warn_once_background(("base-unreadable", _TYPE_MODULE(base), _TYPE_QUALNAME(base)),
+                              "%s.%s: its __dict__ has a key that is not a plain str - its "
+                              "*_instance fields are not looked for, so a project class "
+                              "inheriting one is not filled from it",
+                              _TYPE_MODULE(base), _TYPE_QUALNAME(base))
+        return frozenset()
+    try:
+        names = set()
+        for key, member in snapshot.items():
+            if _DEF_ATTR_RE.match(key):
+                names.add(key)
+            if type(member) is types.FunctionType:
+                names.update(_self_stores(member))
+            elif type(member) is staticmethod or type(member) is classmethod:
+                # Its first parameter is not known to be the object (it may be given self): every
+                # assignment counts - a field reported in doubt, never one lost (round 20).
+                function = member.__func__
+                if type(function) is types.FunctionType:
+                    names.update(_every_store(function))
+        return frozenset(names)
+    finally:
+        # The copy may hold the last reference of a value removed meanwhile: it is dropped after
+        # the library lock is released (its __del__ is user code).
+        _GLOBAL_LOCK.let_go(snapshot)
+
+
+def _self_stores(function) -> set:
+    """The *_instance names ``function`` assigns on its first parameter (``self.x_instance = ...``);
+    an assignment on any other object is not one of the class's fields. On a Python whose bytecode
+    the check below does not recognise, every assignment counts (never fewer fields)."""
+    if not _self_stores_recognised():
+        return _every_store(function)
+    return _owner_stores(function)
+
+
+def _every_store(function) -> set:
+    """Every *_instance name ``function`` assigns, whatever the object."""
+    return {instruction.argval for instruction in dis.get_instructions(function)
+            if instruction.opname == "STORE_ATTR" and _DEF_ATTR_RE.match(instruction.argval)}
+
+
+_STORE_PROBE: list = []  # [True/False] once known: does _owner_stores read this Python's bytecode?
+
+
+def _self_stores_recognised() -> bool:
+    """Checked once per process on known shapes: a plain store, a store of a parameter (a paired
+    load on 3.13+), a store on another object, a store past the 256th name (EXTENDED_ARG), a store
+    on a ``self`` a closure captures (LOAD_DEREF). If this
+    Python's bytecode differs, one WARNING says so and every assignment counts from then on."""
+    if not _STORE_PROBE:
+        namespace: Dict[str, Any] = {}
+        exec("def probe(self, other, value):\n"
+             "    self.a_instance = None\n    self.b_instance = value\n    other.c_instance = None\n"
+             + "".join(f"    self.n{i} = None\n" for i in range(300))
+             + "    self.d_instance = None\n", namespace)
+        exec("def captured(self):\n    self.e_instance = None\n    return lambda: self\n", namespace)
+        recognised = (_owner_stores(namespace["probe"]) == {"a_instance", "b_instance", "d_instance"}
+                      and _owner_stores(namespace["captured"]) == {"e_instance"})
+        if not recognised:
+            # The library lock may be held here: a log handler never runs under it.
+            _warn_once_background(("bytecode-unrecognised",),
+                                  "The bytecode of this Python (%s) is not recognised: a "
+                                  "*_instance field assigned by a base outside the project is "
+                                  "found from every assignment in its methods, so a field of "
+                                  "another object may be reported too", sys.version.split()[0])
+        _STORE_PROBE.append(recognised)
+    return _STORE_PROBE[0]
+
+
+_UNKNOWN_OWNER = object()
+
+
+def _owner_stores(function) -> set:
+    """The *_instance stores whose object is the first parameter - loaded as a local (LOAD_FAST*)
+    or as a cell a closure captures (LOAD_DEREF, LOAD_CLOSURE). A store on an object the scan
+    names as another one (another variable, a global, an attribute) is not counted; one whose
+    object it cannot name (a call result, ...) is counted: in doubt a field is reported, never
+    lost."""
+    code = function.__code__
+    if not code.co_argcount:
+        return set()
+    first, names, owner = code.co_varnames[0], set(), _UNKNOWN_OWNER
+    for instruction in dis.get_instructions(function):
+        name = instruction.opname
+        if name == "EXTENDED_ARG":
+            continue  # a prefix of the next instruction
+        if (name == "STORE_ATTR" and _DEF_ATTR_RE.match(instruction.argval)
+                and (owner is _UNKNOWN_OWNER or owner == first)):
+            names.add(instruction.argval)
+        owner = _UNKNOWN_OWNER
+        if name.startswith(("LOAD_FAST", "LOAD_DEREF", "LOAD_CLOSURE")):
+            loaded = instruction.argval  # a pair is pushed left to right: the last one is on top
+            owner = loaded[-1] if type(loaded) is tuple else loaded
+        elif name.startswith(("LOAD_GLOBAL", "LOAD_NAME", "LOAD_ATTR")):
+            owner = None  # another object, named
+    return names
+
+
+def _in_project(cls) -> bool:
+    """True when ``cls``'s module is a file under a project root - auto_inject() patches the
+    classes there. Plain values only: no code of the module or the class runs."""
+    module_name = _TYPE_MODULE(cls)
+    module = sys.modules.get(module_name) if type(module_name) is str else None
+    if module is None or not any(klass is types.ModuleType for klass in _TYPE_MRO(type(module))):
+        return False
+    path = _MODULE_DICT(module).get("__file__")
+    return type(path) is str and _is_late_root_path(path)
 
 
 def _is_accessor(cls, name: str) -> bool:
@@ -628,14 +818,24 @@ def _patch_setattr(cls, container, name_map):
                         f"{reg.service_type.__name__} could not be resolved"
                     ) from e
             else:
-                _warn_once(("unregistered", cls.__module__, cls.__qualname__, name),
-                           "%s.%s.%s: no matching registration; the field stays None",
-                           cls.__module__, cls.__qualname__, name)
+                _warn_unregistered_field(cls, name)
 
         return orig_setattr(self, name, value)
 
     cls.__setattr__ = __setattr__
     cls.__ai_ioc_setattr__ = True
+
+
+def _warn_unregistered_field(cls, name: str) -> None:
+    """A field with no matching registration stays None: one WARNING per field and reason, the same
+    from the eager (__setattr__) and the post-init path, naming the real reason."""
+    no_startup = _NAME_MAP_CACHE is None
+    _warn_once(("unregistered-no-startup" if no_startup else "unregistered",
+                cls.__module__, cls.__qualname__, name),  # each reason is reported once
+               "%s.%s.%s: no matching registration; the field stays None%s",
+               cls.__module__, cls.__qualname__, name,
+               " (no container is active: the application's startup has not run)"
+               if no_startup else "")
 
 
 def _inject_fields(self, cls, container, name_map, di_candidates) -> None:
@@ -664,11 +864,7 @@ def _inject_fields(self, cls, container, name_map, di_candidates) -> None:
         )
 
         if not reg:
-            _warn_once(("unregistered", cls.__module__, cls.__qualname__, attr),
-                       "%s.%s.%s: no matching registration; the field stays None%s",
-                       cls.__module__, cls.__qualname__, attr,
-                       "" if _NAME_MAP_CACHE is not None else
-                       " (no container is active: the application's startup has not run)")
+            _warn_unregistered_field(cls, attr)
             continue
 
         try:
@@ -702,8 +898,9 @@ def _patch_init(cls, container, name_map):
     #        Çalışma anındaki pahalı dir() taraması (~2.6µs/nesne) kalkar.
     di_candidates = cls.__dict__.get("__di_attrs__")
     if di_candidates is None:
-        di_candidates = _find_di_candidates(cls)
+        di_candidates, own = _find_di_candidate_parts(cls)
         cls.__di_attrs__ = di_candidates
+        cls.__di_own_attrs__ = own  # the container's "field injection only" measure
 
     def __init__(self, *args, **kwargs):
         # A non-callable __init__ fails exactly as it would without the patch.
@@ -725,6 +922,7 @@ def _patch_init(cls, container, name_map):
         __init__.__name__ = "__init__"
     cls.__init__ = __init__
     cls.__ai_ioc_init__ = True
+    _PATCHED_IDS[id(cls)] = weakref.ref(cls, _forget_patched(id(cls)))
 
 
 # ============================================================================
@@ -989,9 +1187,10 @@ def _patch_module_classes(mod, container, name_map) -> int:
         if not PATCH_ALL_MODE:
             candidates = cls.__dict__.get("__di_attrs__")
             if candidates is None:
-                candidates = _find_di_candidates(cls)
+                candidates, own = _find_di_candidate_parts(cls)
                 try:
                     cls.__di_attrs__ = candidates
+                    cls.__di_own_attrs__ = own  # the container's "field injection only" measure
                 except (TypeError, AttributeError):
                     pass  # bazı exotic tipler attribute kabul etmez
             if not candidates:
@@ -1295,6 +1494,7 @@ def _serialized_class_patching(func):
     @wraps(func)
     def locked(*args, **kwargs):
         with _GLOBAL_LOCK:
+            _GLOBAL_LOCK.let_go(_NAME_MAP_CACHE)  # the active map it may replace: let go after the lock
             return func(*args, **kwargs)
 
     return locked
@@ -1459,24 +1659,205 @@ def _open_fields(cls):
 
 
 _INJECTED_FIELDS = weakref.WeakKeyDictionary()  # class -> its *_instance fields, for injected()
+_REGISTERED_REPORTED = weakref.WeakKeyDictionary()  # registered class -> {reason: fields reported}
+# The classes the library patched, kept by the library itself: id -> weak reference. Asking it
+# needs no dictionary of the class (int keys: no user __hash__/__eq__).
+_PATCHED_IDS: Dict[int, Any] = {}
 
 
-def _inject_unpatched(instance, container) -> None:
+def _forget_patched(key: int):
+    def forget(ref) -> None:  # the class is gone: drop its entry (no lock; a dict op)
+        if _PATCHED_IDS.get(key) is ref:
+            del _PATCHED_IDS[key]
+    return forget
+# A class's own namespace, MRO and names, read through type's own descriptors (as
+# inspect.getattr_static does): a metaclass that redefines them runs no code here.
+_TYPE_DICT = type.__dict__["__dict__"].__get__
+_TYPE_MRO = type.__dict__["__mro__"].__get__
+_TYPE_MODULE = type.__dict__["__module__"].__get__
+_TYPE_QUALNAME = type.__dict__["__qualname__"].__get__
+_MODULE_DICT = types.ModuleType.__dict__["__dict__"].__get__
+
+
+def _inject_unpatched(instance, container) -> bool:
     """injected() built an object of a class discovery never patched (outside the
     project root, or created after startup): fill the None fields of that ONE
     object, the way a patched __init__ does. The class is not changed - modules
     outside the project are never touched - so a field used inside __init__ right
     after ``= None`` is not filled yet there. The caller checked that no other
     container is the active one (_check_active); with none active (startup has not
-    run) a field that is not found stays None with a WARNING naming it, as in 0.5.3."""
+    run) a field that is not found stays None with a WARNING naming it, as in 0.5.3. True when the
+    class is patched (nothing to do here, ever)."""
     cls = type(instance)
+    candidates = _unpatched_candidates(cls)
+    if candidates is None:
+        return True
+    _inject_fields(instance, cls, container, {}, candidates)
+    return False
+
+
+def _unpatched_candidates(cls):
+    """The *_instance fields of a class discovery never patched (found once per class); None
+    for a patched class - its patched __init__ handles its fields."""
     if cls.__dict__.get("__ai_ioc_init__", False):
-        return  # its patched __init__ has filled it
+        return None  # its patched __init__ has filled it
     try:
-        candidates = _INJECTED_FIELDS[cls]
+        return _INJECTED_FIELDS[cls]
     except KeyError:
         candidates = _INJECTED_FIELDS[cls] = _find_di_candidates(cls)
-    _inject_fields(instance, cls, container, {}, candidates)
+        return candidates
+
+
+def _warn_unfilled_registered(instance) -> bool:
+    """injected() got a registered type whose class discovery never patched (startup has not run,
+    the class is outside the project root, was created after startup or showed no field when it
+    was scanned). Its None fields are NOT
+    filled from outside the container: a shared singleton would keep the first request's scoped
+    objects. One WARNING per field (the same once-only rule as every field WARNING) says so.
+
+    Only PLAIN values are read: the object's own dictionary when it is a plain dict from Python's
+    own __dict__, plain class values and slots - no code of the object, its class or its metaclass
+    runs. Anything else (the class defines its own __dict__, the dictionary is a dict subclass, a
+    field-like name is a descriptor) is one WARNING per class and reason: its fields cannot be
+    checked - never silence. Nothing here may change what injected() returns: a failure of the check
+    itself is one WARNING. True when the library patched the class (nothing to check, ever)."""
+    cls = type(instance)
+    patched = _PATCHED_IDS.get(id(cls))
+    if patched is not None and patched() is cls:
+        return True  # the library patched it: its own __init__ handles its fields (nothing is read)
+    module, name = _TYPE_MODULE(cls), _TYPE_QUALNAME(cls)
+    try:
+        # Only plain snapshots are looked at from here on (_plain_snapshot): never a live mapping
+        # twice, never a key that is not exactly a str.
+        merged, unchecked = _class_chain(cls)
+        if unchecked is None:
+            own, unchecked = _plain_fields_source(instance, cls, merged)
+        if unchecked is not None:
+            _warn_once(("registered-unchecked", module, name, unchecked),
+                       "%s.%s: its fields cannot be checked (%s) - injected() reads only plain "
+                       "values, so it cannot see whether one is left None",
+                       module, name, unchecked)
+            return
+        no_startup = _NAME_MAP_CACHE is None
+        # Each field is reported once per reason; a field already reported is not read again.
+        reported = _REGISTERED_REPORTED.setdefault(cls, {}).setdefault(no_startup, set())
+        for attr in _unfilled_fields(instance, cls, merged, own, reported):
+            _warn_once(("registered-unpatched-no-startup" if no_startup else "registered-unpatched",
+                        module, name, attr),
+                       "%s.%s.%s: the field stays None - a registered type's fields are not filled "
+                       "from outside the container (%s); move the class inside the project root or "
+                       "use constructor injection",
+                       module, name, attr,
+                       "no container is active: the application's startup has not run" if no_startup
+                       else "its class is in the project but was never patched: no *_instance "
+                            "field was found in it when it was scanned, or it was created after "
+                            "startup" if _in_project(cls)
+                       else "its class was never patched: it is outside the project root")
+            reported.add(attr)
+    except Exception as error:
+        try:
+            _warn_once(("registered-unpatched-check", module, name),
+                       "%s.%s: the check for fields left None failed (%r); the object is returned "
+                       "as built", module, name, error)
+        except Exception:
+            pass  # the log itself fails: the object is still returned as built
+
+
+def _plain_snapshot(mapping):
+    """A copy of ``mapping`` (an exact dict, or a class's mappingproxy) when every key is exactly a
+    str; otherwise None. Its items are taken in ONE pass - walking runs no __hash__ or __eq__ - and
+    the copy is built only from verified str keys (str hashing and equality are C code). After it
+    the check looks only at copies, never at the live mapping again: no race with a thread that
+    changes it."""
+    items = list(mapping.items())
+    for key, _ in items:
+        if type(key) is not str:
+            # The list may hold a value's last reference (the mapping changed meanwhile, or it
+            # was built on the fly): dropped after the library lock - its __del__ is user code.
+            _GLOBAL_LOCK.let_go(items)
+            return None
+    return dict(items)
+
+
+def _class_chain(cls) -> tuple:
+    """(its MRO's plain snapshots merged - the first class wins, as attribute lookup does -, None)
+    or (None, why not)."""
+    merged = {}
+    for klass in reversed(_TYPE_MRO(cls)):
+        snapshot = _plain_snapshot(_TYPE_DICT(klass))
+        if snapshot is None:
+            return None, f"the __dict__ of {_TYPE_QUALNAME(klass)} has a key that is not a plain str"
+        merged.update(snapshot)
+    return merged, None
+
+
+def _plain_fields_source(instance, cls, merged) -> tuple:
+    """(a plain snapshot of the object's own dictionary, None) when its fields can be read as plain
+    values without running any code; otherwise (None, why they cannot be checked)."""
+    found = merged.get("__dict__", _UNSET)
+    if found is _UNSET:
+        own = {}  # no __dict__ at all: slots only
+    elif type(found) is not types.GetSetDescriptorType:
+        return None, "the class defines its own __dict__"
+    else:
+        try:  # the checked getset itself (C code): no second live lookup of __dict__
+            live = found.__get__(instance, cls)
+        except AttributeError:
+            live = {}
+        if type(live) is not dict:
+            return None, "its __dict__ is not a plain dict"
+        own = _plain_snapshot(live)
+        if own is None:
+            return None, "its __dict__ has a key that is not a plain str"
+    copies = {}  # this check's copies of the value types' dictionaries (never kept across checks)
+    for field in sorted(name for name in merged if _DEF_ATTR_RE.match(name)):
+        value = merged[field]
+        if type(value) is types.MemberDescriptorType:
+            continue  # a slot: read by C code
+        kind = _is_descriptor(value, copies)
+        if kind is None:
+            return None, f"the type of {field}'s value has a key that is not a plain str"
+        if kind:
+            return None, f"{field} is a descriptor, not a plain value"
+    return own, None
+
+
+def _unfilled_fields(instance, cls, merged, own, skip=frozenset()) -> list:
+    """The *_instance fields that hold None - plain values only (see _plain_fields_source); the
+    names in ``skip`` are not read. Every name is read every time: a field the class gets later is
+    seen too (only the values of reported fields are not read again)."""
+    names = {name for name in (*own, *merged) if _DEF_ATTR_RE.match(name)}  # plain str keys only
+    return [name for name in sorted(names - skip) if _field_value(instance, cls, merged, name, own) is None]
+
+
+def _is_descriptor(value, copies):
+    """True when ``value``'s type defines __get__, __set__ or __delete__; None when one of that
+    type's dictionaries has a key that is not a plain str (it is not looked into). ``copies``:
+    id(class) -> (class, copy) of this one check."""
+    for klass in _TYPE_MRO(type(value)):
+        cached = copies.get(id(klass))
+        if cached is not None and cached[0] is klass:
+            snapshot = cached[1]
+        else:
+            snapshot = _plain_snapshot(_TYPE_DICT(klass))
+            copies[id(klass)] = (klass, snapshot)
+        if snapshot is None:
+            return None
+        if "__get__" in snapshot or "__set__" in snapshot or "__delete__" in snapshot:
+            return True
+    return False
+
+
+def _field_value(instance, cls, merged, name, own):
+    """One plain field's value: a slot (C read), else the object's own value, else the class
+    value; _UNSET: none. Only called after _plain_fields_source said the values are plain."""
+    in_class = merged.get(name, _UNSET)
+    if type(in_class) is types.MemberDescriptorType:  # a slot: the C-level read runs no user code
+        try:
+            return in_class.__get__(instance, cls)
+        except AttributeError:  # never set (no __getattr__ is asked)
+            return _UNSET
+    return own.get(name, in_class)  # the object's own value comes before the class value
 
 
 def _check_active(container) -> None:
@@ -1490,9 +1871,10 @@ def _check_active(container) -> None:
         raise DependencyInjectionError(
             "This request's container is not the active one: another application's container "
             "was activated in this process. py_autowired supports one container per process: "
-            "run each application in its own process; in tests, open each application with "
-            "`with TestClient(app)` (its startup makes its container the active one) or call "
-            "activate_container(container)")
+            "run each application in its own process. In tests: open each FastAPI application "
+            "with `with TestClient(app)` (its startup makes its container the active one); with "
+            "Flask or Django, or anywhere, call activate_container(container) before using "
+            "another application")
 
 
 def _warn_equal_candidates(container, name_map) -> None:
@@ -1614,6 +1996,7 @@ def activate_container(container) -> None:
     global _NAME_MAP_CACHE
     with _GLOBAL_LOCK:
         if _NAME_MAP_CACHE is None or _NAME_MAP_CACHE._container is not container:
+            _GLOBAL_LOCK.let_go(_NAME_MAP_CACHE)  # the replaced map: let go after the lock
             _NAME_MAP_CACHE = _CachedNameMap(container)
         failed = _drain_late_modules()
     # The container is active; now report what the drained imports found.
@@ -1739,7 +2122,7 @@ def _validate_autowiring(container, classes, skipped=(), untracked=()):
         except (TypeError, ValueError) as error:
             if lifetime_only:
                 return []
-            if getattr(impl, "__di_attrs__", ()):
+            if _field_injection_only(impl):
                 # The container builds a field-injection class without arguments
                 # and without reading the signature: it cannot be checked here.
                 _warn_once(("signature", impl.__module__, impl.__qualname__),
@@ -1754,7 +2137,7 @@ def _validate_autowiring(container, classes, skipped=(), untracked=()):
         }]
         problems = []
         # Mirror the container's existing no-argument field-injection shortcut.
-        if not (getattr(impl, "__di_attrs__", ()) and all(
+        if not (_field_injection_only(impl) and all(
             p.default is not inspect.Parameter.empty for p in parameters
         )):
             hints, extras, hint_error = _constructor_hints(impl.__init__)

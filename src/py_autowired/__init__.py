@@ -72,3 +72,9 @@ __all__ = [
     "skipped_during_discovery",
     "validate_autowiring",
 ]
+
+# Free-threaded 3.14: a new thread must not inherit the library's context values (another
+# request's scope). A no-op where threads do not inherit their starter's context.
+from .container import _ThreadBirth as _thread_birth  # noqa: E402
+
+_thread_birth._install()

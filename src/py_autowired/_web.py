@@ -10,12 +10,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import sys
-import threading
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from . import autowired
 from .autowired import _check_active, _find_project_root, activate_container, auto_inject
-from .container import Container
+from .container import Container, _LibraryLock
 
 
 def caller_root(depth: int, marker: Optional[str] = None) -> Optional[str]:
@@ -50,14 +50,16 @@ class Startup:
         self.exclude_dirs = exclude_dirs
         self.validate = validate
         self.done = False
-        self._lock = threading.Lock()
+        self._lock = _LibraryLock()
 
     def ensure(self) -> None:
         if self.done:  # every request after the first: no lock
             return
+        retired = None
         with self._lock:
             if self.done:
                 return
+            retired = autowired._NAME_MAP_CACHE  # the map startup replaces: let go after the lock
             auto_inject(
                 self.container,
                 root_dir=self.root_dir,
@@ -66,6 +68,7 @@ class Startup:
             )
             activate_container(self.container)
             self.done = True
+        del retired
 
 
 class _ClosingResult:

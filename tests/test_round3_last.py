@@ -201,7 +201,7 @@ def test_t3_4_the_active_container_s_cache_is_used_when_it_is_its_own(monkeypatc
     maps = []
     real_map = autowired._build_name_map_from_container
     monkeypatch.setattr(autowired, "_build_name_map_from_container",
-                        lambda owner: maps.append(owner) or real_map(owner))
+                        lambda owner, **kw: maps.append(owner) or real_map(owner, **kw))
 
     class OwnT3:
         def __init__(self):

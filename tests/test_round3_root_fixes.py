@@ -250,7 +250,7 @@ def test_a3_injected_fills_the_fields_of_an_unpatched_class(graph, monkeypatch):
     maps = []
     real_map = autowired._build_name_map_from_container
     monkeypatch.setattr(autowired, "_build_name_map_from_container",
-                        lambda owner: maps.append(owner) or real_map(owner))
+                        lambda owner, **kw: maps.append(owner) or real_map(owner, **kw))
     scans = _counting_scans(monkeypatch)
     made = asyncio.run(injected(NeverPatchedA3)(_request_for(container)))
     assert isinstance(made.clocka3_instance, _ClockA3)
