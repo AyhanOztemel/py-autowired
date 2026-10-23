@@ -458,3 +458,31 @@ def test_a_reload_found_only_with_its_target_is_still_patched(project, monkeypat
         assert module.Reloaded().clock_instance is not None, "a module reloaded through its target was not patched"
     finally:
         sys.modules.pop(name, None)
+
+
+
+def test_an_empty_entry_is_read_where_python_reads_it(project, monkeypatch):
+    """G10 (focused review): "" on sys.path is the working directory, and Python keys its finder for
+    it by that directory - it never reads a "" key of sys.path_importer_cache. With None stored under
+    "" (a key Python never reads), a project module found through "" is still patched: the
+    pre-check looks where Python looks."""
+    root, tag, names = project
+    _start(root, tag)
+    sub = root / f"emptysub_{tag}"
+    sub.mkdir()
+    name = f"emptymod_{tag}"
+    (sub / f"{name}.py").write_text("class Consumer:\n    def __init__(self):\n        self.clock_instance = None\n")
+    hook = next(f for f in sys.meta_path if isinstance(f, autowired._LateImportFinder))
+    standard = [importlib.machinery.BuiltinImporter, importlib.machinery.FrozenImporter,
+                importlib.machinery.PathFinder]
+    monkeypatch.setattr(sys, "meta_path", [hook] + standard)  # no other finder to rescue the name
+    monkeypatch.setattr(sys, "path", [""] + [p for p in sys.path if p not in ("", ".")])
+    monkeypatch.setattr(sys, "path_importer_cache", dict(sys.path_importer_cache))
+    monkeypatch.chdir(sub)
+    importlib.invalidate_caches()
+    monkeypatch.setitem(sys.path_importer_cache, "", None)  # after the last invalidate_caches()
+    try:
+        module = importlib.import_module(name)
+        assert module.Consumer().clock_instance is not None, "a module found through '' was not patched"
+    finally:
+        sys.modules.pop(name, None)
