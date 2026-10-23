@@ -525,3 +525,130 @@ def test_the_finalizer_read_first_is_the_one_called(closing):
         expected = ["aclose"]
     assert closed == expected, "the finalizer was read twice and never called"
     assert made.reads == 1
+
+
+
+# ---- a3a2 consensus (Z): the close waits for a creation in flight; meanwhile nothing is handed out ----
+
+def _close_while_a_creation_is_in_flight(container, Q, during_wait, in_finalizer=None, hooks=None):
+    """Q is ready; another thread creates Slow (its gate held); a third thread closes the scope - the
+    close flags it closed and waits for that gate. ``during_wait`` runs while the close waits;
+    ``in_finalizer`` runs inside Q's finalizer (after the wait). Returns when everything is done."""
+    import time
+
+    started, finish = threading.Event(), threading.Event()
+
+    class Slow:
+        def __init__(self):
+            started.set()
+            finish.wait(10)
+
+    container.register_scoped(Slow)
+    scope = container.create_scope()
+    scope.__enter__()
+    try:
+        container.resolve(Q)
+        context = contextvars.copy_context()  # the readers' (a context runs in one thread at a time)
+        if in_finalizer is not None:
+            hooks["Q"] = lambda _: in_finalizer(scope, context)
+        creator = threading.Thread(target=contextvars.copy_context().run, args=(container.resolve, Slow))
+        creator.start()
+        assert started.wait(10)
+        closer = threading.Thread(target=scope.state.close)
+        closer.start()
+        deadline = time.monotonic() + 10
+        while not scope.state.closed and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert scope.state.closed and closer.is_alive(), "the close did not wait for the creation"
+        during_wait(scope, context)
+        finish.set()
+        creator.join(10)
+        closer.join(10)
+        assert not closer.is_alive()
+    finally:
+        finish.set()
+        scope._leave()
+
+
+def test_e_a_ready_object_is_never_handed_out_while_the_close_waits_for_a_creation():
+    """Z (a3a2 consensus, a real defect): after `closed` was set and while the close waited for a
+    creation in flight, the lock-free path still handed a ready object - about to be disposed - to
+    another context."""
+    hooks, out = {}, {}
+    container, P, Q, R = build(hooks)
+
+    def read(scope, context):
+        reader = threading.Thread(
+            target=lambda: out.__setitem__("v", context.run(lambda: outcome(lambda: container.resolve(Q)))))
+        reader.start()
+        reader.join(10)
+
+    _close_while_a_creation_is_in_flight(container, Q, read)
+    assert out["v"] == "closed", out
+
+
+def test_f_after_the_wait_the_objects_are_out_of_the_lock_free_path():
+    """U1c (gate): the swap after waiting for the creations empties the lock-free path - a finalizer
+    sees no object there, and a reader with an earlier copy of the context gets none."""
+    hooks, out = {}, {}
+    container, P, Q, R = build(hooks)
+
+    def in_finalizer(scope, context):
+        out["instances"] = dict(scope.state.instances)
+        reader = threading.Thread(
+            target=lambda: out.__setitem__("v", context.run(lambda: outcome(lambda: container.resolve(P)))))
+        reader.start()
+        reader.join(10)
+
+    _close_while_a_creation_is_in_flight(container, Q, lambda scope, context: None, in_finalizer, hooks)
+    assert out["instances"] == {}, out
+    assert out["v"] == "closed", out
+
+
+# ---- a3a2 consensus: the creation gates ----
+
+def test_g_a_failed_scoped_creation_leaves_no_gate():
+    """N5d (gate): a scoped factory that fails leaves no creation gate behind - one per failed slot
+    would pile up in a long-lived scope."""
+    from py_autowired import LifetimeScope
+
+    container = Container()
+    A = type("A", (), {})
+    B = type("B", (), {})
+
+    def boom(_):
+        raise KeyError("boom")
+
+    container.register_factory(A, boom, LifetimeScope.SCOPED)
+    container.register_factory(B, boom, LifetimeScope.SCOPED)
+    with container.create_scope() as scope:
+        for cls in (A, B, A):
+            with pytest.raises(KeyError):
+                container.resolve(cls)
+            assert scope.state.gates == {}, scope.state.gates
+
+
+def test_h_an_inner_resolution_of_the_same_slot_keeps_the_outer_gate():
+    """N5e (gate, Y and Z): a context copied before the resolution started lets the outer factory
+    resolve the same slot again (no cycle is seen there): the gate is taken a second time by the same
+    thread. The inner resolution must not remove the gate the outer one still holds."""
+    from py_autowired import LifetimeScope
+
+    container = Container()
+    S = type("S", (), {})
+    seen = {}
+    with container.create_scope() as scope:
+        early = contextvars.copy_context()
+
+        def outer(c):
+            if "outer" in seen:
+                return S()  # the inner call
+            seen["outer"] = True
+            gate = scope.state.gates.get(S)
+            early.run(c.resolve, S)
+            seen["kept"] = scope.state.gates.get(S) is gate
+            return S()
+
+        container.register_factory(S, outer, LifetimeScope.SCOPED)
+        container.resolve(S)
+    assert seen.get("kept") is True, seen

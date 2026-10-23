@@ -640,8 +640,19 @@ bir satırda adıyla bildirir.
   konteyner olduğu denetimi (her bağımlılıkta da; WebSocket ya da ara katman
   dışı bir bağımlılık için tek denetim), kayıtlı türün alan denetimi (sınıfının
   yamalı olduğu bilindikten sonra tek kimlik karşılaştırması) ve ortak alan
-  döngüsü. Gerçek bir istekte (yönlendirme, ara katman, scope) bu yüzde birin
-  altındadır; yayın ikisini de ölçer.
+  döngüsü.
+- **Kütüphanenin istek başı maliyeti, 0.5.3'e göre** (CPython 3.11, Windows: istek
+  ara katmanı - etkin konteyner denetimi, scope açma ve kapama - ve bir
+  `injected()` bağımlılığı, web çatısı olmadan): boş scope yaklaşık 17,7 µs (0.5.3:
+  12,6), kayıtlı singleton yaklaşık 19,6 µs (14,0), scoped servis yaklaşık 49,7 µs
+  (24,8). Bilerek ödenen bedel: kütüphane kilidi tutulurken hiçbir log işleyicisi
+  çalışmaz (scope kilidi de bunlardan biri), GIL'siz yapıda thread doğumu kuralı
+  giren thread'i okur, kapanan scope sonlandırıcılarının bağlamını işaretler ve
+  scoped servis kendi oluşturma kapısının arkasında kurulur - aynı scope'taki iki
+  eşzamanlı istek asla iki nesne kurmaz, bir kilit döngüsü takılmak yerine hata
+  verir. En büyük pay scoped oluşturma yolunun; yeniden tasarımı 0.5.5 için
+  planlandı. Aynı makinede FastAPI üzerinden bir web isteği kendi başına yaklaşık
+  150-230 µs ekler.
 - **Log kaydının ne zaman yazıldığı:** bir iş parçacığı kütüphane kilidi
   tutarken (oluşturma kilidi, kütüphane kilidi, kayıt, sağlayıcı, scope, ad
   haritası, thread doğumu ya da başlangıç kilidi) kütüphanenin her kaydı (her

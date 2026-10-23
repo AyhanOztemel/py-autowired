@@ -372,6 +372,13 @@ Each changed test pinned a defect, not a contract:
   transient, fixed before release). Now, against 0.5.3 (3.11, the dependency
   alone): singleton about +10%, transient about +9%, unregistered controller
   about +6%; see "Known limits" for what the rest costs and why it is kept.
+  The library's per-request path (middleware, scope open and close, one
+  dependency; no web framework), against 0.5.3: empty scope 12.6 -> 17.7 µs,
+  registered singleton 14.0 -> 19.6 µs, scoped service 24.8 -> 49.7 µs. The
+  scoped creation gate (concurrent creation correctness) is the largest part;
+  its redesign is the first item of 0.5.5. A close that waits for a creation in
+  flight no longer hands a ready object of that scope to another context
+  (found in the final review; the object was about to be disposed).
 - `test_a_singleton_not_created_yet_still_does_the_bookkeeping` and
   `test_other_lifetimes_still_do_the_bookkeeping`: every resolution counted a
   "resolution depth" to keep WARNINGs until creation locks were released ->

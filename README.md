@@ -650,8 +650,19 @@ What 0.5.4 does not promise, in one place:
   dependency, the only check for a WebSocket or a dependency outside the
   middleware), the check of a registered type's fields (one identity
   comparison once its class is known to be patched) and the shared post-init
-  loop. In a real request (routing, middleware, scope) this is a fraction of a
-  percent; the release measures both.
+  loop.
+- **Per-request cost of the library against 0.5.3** (CPython 3.11, Windows: the
+  request middleware - active-container check, scope open and close - and one
+  `injected()` dependency, without the web framework): an empty scope about
+  17.7 µs (0.5.3: 12.6), a registered singleton about 19.6 µs (14.0), a scoped
+  service about 49.7 µs (24.8). Why, on purpose: no log handler runs while a
+  library lock is held (the scope's lock counts as one), the free-threaded
+  build's thread-birth rule reads the entering thread, the closing scope marks
+  its finalizers' context, and a scoped service is created behind its own
+  creation gate - two concurrent requests for it in one scope never build two
+  objects, and a lock cycle raises instead of hanging. The scoped creation path
+  is the largest part; its redesign is planned for 0.5.5. A web request through
+  FastAPI on the same machine adds about 150-230 µs of its own.
 - **When a log record is written:** while a thread holds a library lock (a
   creation lock, the library lock, the registration, provider, scope, name map,
   thread-birth or startup lock), every record of the library (any level) is

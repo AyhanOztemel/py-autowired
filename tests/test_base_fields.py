@@ -222,10 +222,12 @@ def test_a_store_on_an_attribute_of_self_or_without_parameters_is_not_a_field():
 
 
 def test_a_store_after_many_names_is_still_seen():
-    """A name past the 256th needs an EXTENDED_ARG prefix before STORE_ATTR."""
+    """A name past the 256th needs an EXTENDED_ARG prefix before STORE_ATTR - for self it counts, for
+    another object it does not (TB11, gate: the prefix must not reset the known owner)."""
     body = "".join(f"    self.n{i} = None\n" for i in range(300))
     namespace = {}
-    exec("def setup(self):\n" + body + "    self.repo_instance = None\n", namespace)
+    exec("def setup(self, other):\n" + body + "    other.x_instance = None\n"
+         "    self.repo_instance = None\n", namespace)
     assert autowired._self_stores(namespace["setup"]) == {"repo_instance"}
 
 
@@ -682,3 +684,38 @@ def test_a_base_s_annotation_is_still_a_candidate_of_the_subclass(tmp_path, monk
     module = sys.modules[f"bf_proj_{tag}"]
     assert isinstance(module.Sub().repo_instance, servis.Repo), "the field stayed None"
     assert module.Sub.__dict__["__di_own_attrs__"] == ()
+
+
+
+def test_a_plain_function_without_parameters_in_a_base_is_read_without_error():
+    """TB14 (gate): a plain function without any parameter in the body of a base outside the project
+    (not a static method) has no first parameter - it gives no field and never breaks the read."""
+    class Outside:
+        def helper():  # noqa: N805 - no parameter on purpose
+            return 1
+
+        repo_instance = None
+
+    assert autowired._read_outside_base(Outside) == {"repo_instance"}
+
+
+def test_the_bytecode_probe_runs_once_per_process(monkeypatch):
+    """KP3 (gate): the bytecode check runs once per process; every later read reuses its answer
+    (a check on every call made patching about 150 times slower)."""
+    monkeypatch.setattr(autowired, "_STORE_PROBE", [])
+    probes = []
+    real = autowired._owner_stores
+
+    def counting(function):
+        if function.__name__ in ("probe", "captured"):
+            probes.append(function.__name__)
+        return real(function)
+    monkeypatch.setattr(autowired, "_owner_stores", counting)
+
+    class Outside:
+        def a(self):
+            self.a_instance = None
+
+    for _ in range(3):
+        assert autowired._self_stores(Outside.a) == {"a_instance"}
+    assert probes == ["probe", "captured"], probes

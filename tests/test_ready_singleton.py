@@ -201,3 +201,6 @@ def test_a_ready_singleton_detached_between_two_reads_never_answers_with_the_emp
     got = container.resolve(Clock)
     assert got is not container_module._UNSET, "the caller got the empty marker"
     assert isinstance(got, Clock)
+    # E1b (gate): the early return answers with the object it read; the main path would read the
+    # stored instance again, find it detached and build ANOTHER one.
+    assert got is first, "a second object was built for a singleton that was ready"

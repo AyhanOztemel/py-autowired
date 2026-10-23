@@ -602,3 +602,28 @@ def test_a_new_container_never_writes_into_a_dead_containers_untracked_list(monk
         assert not any("dead container" in issue for issue in error.issues)
     finally:
         autowired._UNTRACKED.pop(key, None)
+
+
+
+@pytest.mark.parametrize("startup", [False, True])
+def test_an_unregistered_field_of_a_patched_class_is_one_warning_with_its_reason(startup, monkeypatch, caplog):
+    """UF2 (gate): the eager (__setattr__) and the post-init paths of a patched class report a field
+    with no registration through the same helper - one WARNING, naming the real reason - with or
+    without a started application."""
+    from py_autowired import container as container_module
+
+    monkeypatch.setattr(container_module, "_WARNED", set())
+    container = Container()
+    monkeypatch.setattr(autowired, "_NAME_MAP_CACHE", autowired._CachedNameMap(container) if startup else None)
+
+    class LonelyUF2:
+        def __init__(self):
+            self.clock_instance = None
+
+    autowired._patch_setattr(LonelyUF2, container, {})
+    autowired._patch_init(LonelyUF2, container, {})
+    with caplog.at_level(logging.WARNING, logger="py_autowired"):
+        LonelyUF2()
+    lines = [r.getMessage() for r in caplog.records if "LonelyUF2.clock_instance" in r.getMessage()]
+    assert len(lines) == 1, lines
+    assert ("startup has not run" in lines[0]) is (not startup), lines

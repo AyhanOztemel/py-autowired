@@ -481,3 +481,46 @@ def test_no_user_finalizer_runs_under_the_cache_s_lock(monkeypatch, trigger):
     finalized, done, running = _rebuild_with_a_finalizer(monkeypatch, refresh, trigger)
     assert finalized, "the old registration was not dropped by the rebuild"
     assert done and not running, "a finalizer waited for the cache's lock"
+
+
+
+@pytest.mark.parametrize("debug", [True, False])
+def test_the_name_map_is_logged_once_per_rebuild(monkeypatch, debug):
+    """R15 (pahalı kapı, uzlaşma): in debug mode the name map block is written exactly ONCE per rebuild
+    - the first build, one a registration change triggers, an explicit refresh() - and never while a
+    library lock is held; with debug mode off, never. (The block used to be written under the cache
+    lock; once kept and written after it, a second write from _rebuild would go unnoticed.)"""
+    import logging
+
+    from py_autowired import container as container_module
+
+    monkeypatch.setattr(autowired, "DEBUG_MODE", debug)
+    held_at_write = []
+
+    class Count(logging.Handler):
+        def emit(self, record):
+            if record.getMessage() == "Name map built:":
+                held_at_write.append(container_module._HELD.count)
+
+    handler = Count(logging.DEBUG)
+    log = logging.getLogger("py_autowired")
+    old_level = log.level
+    log.addHandler(handler)
+    log.setLevel(logging.DEBUG)
+    try:
+        container = Container()
+        container.register_singleton(Service, OldImpl)
+        cache = autowired._CachedNameMap(container)
+        counts = []
+        cache.get_raw_map()                                   # the first build
+        counts.append(len(held_at_write))
+        container.replace_singleton(Service, NewImpl)
+        cache.get_raw_map()                                   # a rebuild a registration change triggers
+        counts.append(len(held_at_write))
+        cache.refresh()                                       # an explicit rebuild
+        counts.append(len(held_at_write))
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(old_level)
+    assert counts == ([1, 2, 3] if debug else [0, 0, 0]), counts
+    assert held_at_write == [0] * len(held_at_write), "written while a library lock was held"

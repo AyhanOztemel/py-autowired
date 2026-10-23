@@ -102,12 +102,18 @@ class _LibraryLock:
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
         got = self._lock.acquire(blocking, timeout)
         if got:
-            _hold()
+            _HELD.count += 1
         return got
 
     def release(self) -> None:
         self._lock.release()
-        _unhold()
+        held = _HELD
+        count = held.count
+        if count > 0:
+            count -= 1
+            held.count = count
+        if not count and held.pending:
+            _flush_warnings()
 
     def _is_owned(self) -> bool:
         return self._lock._is_owned()
@@ -116,10 +122,19 @@ class _LibraryLock:
         return self._lock.locked()
 
     def __enter__(self) -> bool:
-        return self.acquire()
+        self._lock.acquire()
+        _HELD.count += 1
+        return True
 
     def __exit__(self, *exc_info: Any) -> None:
-        self.release()
+        self._lock.release()
+        held = _HELD
+        count = held.count
+        if count > 0:
+            count -= 1
+            held.count = count
+        if not count and held.pending:
+            _flush_warnings()
 
 
 def _first_time(key) -> bool:
@@ -751,7 +766,9 @@ class _ScopeState:
     def get_or_create(self, registration: ServiceRegistration, container: "Container") -> Any:
         slot = registration.slot  # == service_type for every unkeyed registration
         instance = self.instances.get(slot, _UNSET)
-        if instance is not _UNSET:
+        if instance is not _UNSET and not self.closed:
+            # Lock-free only while the scope is open: once closed, the close may still be waiting
+            # for a creation and its objects are about to be disposed - the locked path decides.
             return instance
         with self.lock:
             if self.closed:
@@ -766,6 +783,7 @@ class _ScopeState:
         # other slots (and other scopes) are not blocked, and a lock cycle across
         # threads raises CircularDependencyError instead of hanging.
         container._acquire_creation(gate)
+        gate_removed = False
         try:
             with self.lock:
                 if self.closed:
@@ -773,18 +791,25 @@ class _ScopeState:
                 instance = self.instances.get(slot, _UNSET)
             if instance is _UNSET:
                 instance = container._create_instance(registration)
+                with _WAIT_LOCK:
+                    owner = _LOCK_OWNERS.get(id(gate))
+                    outermost = owner is None or owner[1] <= 1
                 with self.lock:
                     self.instances[slot] = instance
                     self.creation_order.append(slot)
+                    if outermost and self.gates.get(slot) is gate:
+                        del self.gates[slot]
+                gate_removed = True
             return instance
         finally:
-            with _WAIT_LOCK:
-                owner = _LOCK_OWNERS.get(id(gate))
-                outermost = owner is None or owner[1] <= 1
-            if outermost:
-                with self.lock:
-                    if self.gates.get(slot) is gate:
-                        del self.gates[slot]
+            if not gate_removed:
+                with _WAIT_LOCK:
+                    owner = _LOCK_OWNERS.get(id(gate))
+                    outermost = owner is None or owner[1] <= 1
+                if outermost:
+                    with self.lock:
+                        if self.gates.get(slot) is gate:
+                            del self.gates[slot]
             container._release_creation(gate)
 
     def _from_closing(self, slot: Any) -> Any:
@@ -874,6 +899,9 @@ class _ScopeState:
                         f"{_slot_name(gate.slot)} in it"
                     )
             self.closed = True
+            if not gates:  # nothing in flight: swap at once (the same order as below)
+                self._closing, self.instances = self.instances, {}
+                return list(self.creation_order)
         for gate in gates:
             # Through the wait-for graph: a lock cycle raises, a hidden wait is reported.
             try:

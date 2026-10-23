@@ -1181,11 +1181,19 @@ def test_a_tool_id_taken_under_the_library_s_name_before_import_is_not_active():
         "import sys, logging, threading, contextvars\n"
         "logging.basicConfig(level=logging.WARNING)\n"
         "sys.monitoring.use_tool_id(4, 'py_autowired thread birth')\n"
+        # U2f2 (gate): the name is held already - the library must not even take an id for a moment
+        # (another tool taking one at that moment would fail): no use_tool_id, no free_tool_id.
+        "calls = []\n"
+        "real_use, real_free = sys.monitoring.use_tool_id, sys.monitoring.free_tool_id\n"
+        "sys.monitoring.use_tool_id = lambda *a: (calls.append(('use',) + a), real_use(*a))[1]\n"
+        "sys.monitoring.free_tool_id = lambda *a: (calls.append(('free',) + a), real_free(*a))[1]\n"
         "import py_autowired\n"
+        "sys.monitoring.use_tool_id, sys.monitoring.free_tool_id = real_use, real_free\n"
         + _HANDED +
-        "print('STATUS', py_autowired._thread_birth.STATUS, 'HANDED', out['v'])\n")
+        "print('STATUS', py_autowired._thread_birth.STATUS, 'HANDED', out['v'], 'IDCALLS', calls)\n")
     assert result.returncode == 0, result.stderr
     assert "STATUS hard-rule HANDED HATA" in result.stdout, result.stdout
+    assert "IDCALLS []" in result.stdout, f"a tool id was taken although the name was held: {result.stdout}"
     assert "could not set up its thread-birth hook" in result.stderr, "no WARNING for the hard rule"
 
 

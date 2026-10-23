@@ -395,3 +395,23 @@ def test_a_log_call_under_a_library_lock_never_waits_for_logging_s_own_lock(call
         release_it.set()
         holder.join(10)
         caller.join(10)
+
+
+
+@pytest.mark.parametrize("kind", ["registration", "scope state", "provider"])
+def test_explicit_acquire_and_release_keep_and_write_like_with(kind, order):
+    """HL6b, HL7b, HL7d (gate): the lock's own acquire()/release() keep a WARNING the same way as
+    `with` does and write it at the last release; the count comes back to where it was."""
+    inside, handler = order
+    lock = _locks()[kind]
+    before = container_module._HELD.count
+    assert lock.acquire()
+    try:
+        inside[0] = True
+        _warn("explicit " + kind)
+        assert handler.seen == [], "written under the lock"
+        inside[0] = False
+    finally:
+        lock.release()
+    assert handler.seen == [False]
+    assert container_module._HELD.count == before
