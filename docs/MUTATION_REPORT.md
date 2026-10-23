@@ -212,3 +212,43 @@ load step (code simplified), a missing non-strict open-generic control, the 7
 above, and in the last rounds: a registration made while the name map was being
 rebuilt, a skipped fallback counted as a change, a cached "no registration"
 answer computed again, and a transient registration carrying an instance.
+
+### 0.5.4 final gates (after twenty review rounds)
+
+The review rounds that followed changed the injection checks, the locking and
+the thread-birth rule again, so the hand-written set grew with them. Before the
+release the whole set ran once more, on the final code, each mutant in its own
+copy of the repository with a 300 s limit, after the same test list had passed
+without a mutant (749 passed, 33 skipped on 3.11; 779 passed, 4 skipped on
+3.14t). These are the real counts; the survivors are listed, not hidden.
+
+| Run | Mutants | Killed | Survived |
+|---|---:|---:|---:|
+| CPython 3.11, every mutant not tied to 3.14 | 464 | 457 | 7 |
+| CPython 3.14, the mutants of code used only on 3.14+ | 5 | 5 | 0 |
+| free-threaded 3.14t, the mutants of code used only there | 35 | 34 | 1 |
+| free-threaded 3.14t, the locking and concurrency subset (selected by the code and the name each mutant changes) | 169 | 168 | 1 |
+
+Survivors: on 3.11 - the name map logged twice per rebuild in debug mode, a
+ready singleton built a second time when the host stops between two reads, a
+second warning without its reason for a field with no registration, a store on
+another object after the 256th name, a function without parameters in a base,
+the bytecode check repeated on every read, and a bytecode change that only
+3.13+ produces (it never ran on 3.14 in the full run: the run selected it for
+3.11 only, where it is equivalent); on 3.14t - a tool id taken for a moment
+although the name was already held. The subset's survivor was the first one
+of the 3.11 list. None was equivalent: each got a test, and a targeted run of
+each one on 3.11 and 3.14t (the bytecode one on 3.14 and 3.14t) killed all of
+them. A later step (a cheaper lock count and two merged lock blocks, then a
+defect the final review found in a closing scope) added mutants that left 7
+more survivors: 6 got tests and were killed (one of them, a nested creation of
+the same slot, had first been taken for equivalent and was not), and 1 is
+equivalent. The set now has 472 active mutants.
+
+Retired mutants: 165, each with its reason in the tool's list. 137 targeted a
+line a later round rewrote and were replaced by a successor; 23 targeted code
+that was removed; 5 are equivalent: a second removal of a creation gate that
+is already gone, two sync/async questions that described the same set, an
+identity comparison CPython never reaches, and the order of a counter only
+tests read. A mutant is retired only with a reason, never deleted.
+

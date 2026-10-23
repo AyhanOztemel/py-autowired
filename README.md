@@ -713,8 +713,13 @@ the same way: 329 mutants, **99.0%** killed among those that can change
 behavior; the code changed in 0.5.2 (several implementations per contract,
 upper case field names): 216 mutants, **100%** of those that can change
 behavior killed. The code changed in 0.5.3 and 0.5.4 was tested with
-hand-written mutants: 322 mutants, **all killed** (each run first runs the
-tests without a mutant, and stops if they do not pass). Full report: [docs/MUTATION_REPORT.md](https://github.com/AyhanOztemel/py-autowired/blob/main/docs/MUTATION_REPORT.md).
+hand-written mutants; the final run on the release code (each run first runs
+the tests without a mutant, and stops if they do not pass): 464 mutants on
+CPython 3.11 - 457 killed, 7 survived; 5 on 3.14 - all killed; 35 on the
+free-threaded 3.14t - 34 killed, 1 survived; a 169-mutant locking subset on
+3.14t - 168 killed, 1 survived. The survivors were closed with tests and a
+targeted run killed every one of them; 165 retired mutants are listed with
+their reasons (5 of them equivalent). Full report: [docs/MUTATION_REPORT.md](https://github.com/AyhanOztemel/py-autowired/blob/main/docs/MUTATION_REPORT.md).
 
 ## License
 
