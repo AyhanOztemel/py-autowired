@@ -662,6 +662,15 @@ bir satırda adıyla bildirir.
   sonra görünebilir.
 - **Kayıttan sonra değişen sınıf bilgisi** (örneğin kayıtlı sınıfın `__name__`'i)
   isim haritasınca kendiliğinden görülmez - `refresh()` çağırın.
+- **İçe aktarma sistemi değişirken yapılan geç içe aktarma:** `auto_inject()`
+  sonrasında ilk kez içe aktarılan bir modül, ancak geç içe aktarma kancasının
+  hızlı kontrolü ile Python'un kendi araması aynı şeyi görürse yamalanır. İki
+  durumda farklı görebilirler: modülün dosyası tam kendi içe aktarmasının o
+  mikrosaniyelerinde oluşturuluyorsa ya da başka bir iş parçacığı içe aktarma
+  sürerken `sys.path`'i veya `sys.path_importer_cache`'i değiştiriyorsa. O zaman
+  modül yamalanmadan yüklenir ve `*_instance` alanları mesajsız `None` kalır.
+  Python da bu iki durumu güvenli saymaz; proje dosyalarını içe aktarmadan önce
+  yazın, `sys.path`'i içe aktaran iş parçacıklarını başlatmadan önce değiştirin.
 - *(0.5.4'te çözüldü)* Eski changelog'lardaki iki sınır artık geçerli değil:
   `replace()` değiştirilen türün alias'larını da yeni kayda taşır; kalıtılan
   `__init__` içinde açıklamasız atanan alanlar enjekte edilir.

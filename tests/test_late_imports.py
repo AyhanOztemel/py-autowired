@@ -199,12 +199,17 @@ def test_the_project_name_check_counts_every_kind_of_entry(tmp_path, monkeypatch
 
 
 def test_a_submodule_whose_parent_path_is_in_the_project_is_the_hook_s(tmp_path, monkeypatch):
+    """A submodule is searched in its parent's path, not in sys.path: a directory of that path under
+    a root that holds it makes it the hook's; a parent path where Python finds nothing does not."""
     root = tmp_path / "root2"
-    root.mkdir()
+    (root / "portion").mkdir(parents=True)
+    (root / "portion" / "sub.py").write_text("")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
     monkeypatch.setattr(autowired, "_LATE_ROOTS", [])
     autowired._remember_late_root(root)
     assert autowired._maybe_project_name("outside_top.sub", [str(root / "portion")])
-    assert not autowired._maybe_project_name("outside_top.sub", [str(tmp_path / "elsewhere")])
+    assert not autowired._maybe_project_name("outside_top.sub", [str(elsewhere)])
 
 
 
@@ -308,3 +313,105 @@ def test_a_project_module_found_by_a_mapping_finder_is_still_patched(tmp_path, m
     finally:
         for key in (name, f"clock_{tag}"):
             sys.modules.pop(key, None)
+
+
+def test_a_relative_entry_above_a_root_names_the_root_package(tmp_path, monkeypatch):
+    """"" on sys.path while the current directory is ABOVE a root: the root package itself is
+    imported under its own name from there - a project name, decided by the current directory."""
+    parent = tmp_path / "rel_parent"
+    root = parent / "rel_app"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(autowired, "_LATE_ROOTS", [])
+    autowired._remember_late_root(root)
+    monkeypatch.setattr(sys, "path", [""] + [p for p in sys.path if p not in ("", ".")])
+    monkeypatch.chdir(parent)
+    assert autowired._maybe_project_name("rel_app", None), "the root package seen from '' was ruled out"
+
+
+def test_a_finder_that_raises_never_rules_a_name_out(tmp_path, monkeypatch):
+    """A broken finder or path hook is not the library's to judge: the name goes the hook's full
+    way (as before the pre-check), never "not a project module" - that would leave it unpatched."""
+    root = tmp_path / "broken_root"
+    root.mkdir()
+
+    class Broken:
+        def find_spec(self, fullname, path, target=None):
+            raise RuntimeError("broken finder")
+
+    monkeypatch.setattr(autowired, "_LATE_ROOTS", [])
+    autowired._remember_late_root(root)
+    monkeypatch.setattr(sys, "meta_path", sys.meta_path + [Broken()])
+    assert autowired._maybe_project_name("anything_at_all", None), "a raising finder ruled the name out"
+
+
+# ---- F3, targeted check 22: Python's finder for an entry decides, not the entry's spelling ----
+
+def test_a_dot_entry_keeps_the_directory_python_froze_for_it(project, tmp_path, monkeypatch):
+    """E1: Python makes its finder for "." with the current directory OF THAT MOMENT and keeps it
+    after a change of directory. The pre-check read "." against the new directory, called the name
+    "not a project module", and Python then loaded it from the root - unpatched."""
+    root, tag, names = project
+    _start(root, tag)
+    sub = root / f"dotsub_{tag}"
+    sub.mkdir()
+    name = f"dotmod_{tag}"
+    (sub / f"{name}.py").write_text("class Dotted:\n    def __init__(self):\n        self.clock_instance = None\n")
+    elsewhere = tmp_path / "dot_elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setattr(sys, "path", ["."] + [p for p in sys.path if p not in ("", ".")])
+    monkeypatch.setattr(sys, "path_importer_cache",
+                        {key: value for key, value in sys.path_importer_cache.items() if key != "."})
+    monkeypatch.chdir(sub)
+    assert importlib.machinery.PathFinder.find_spec(name, ["."]) is not None  # Python's "." finder: sub
+    monkeypatch.chdir(elsewhere)
+    try:
+        module = importlib.import_module(name)  # Python still finds it through that finder
+        assert module.Dotted().clock_instance is not None, "a module found through '.' was not patched"
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_a_parent_path_above_a_root_reaches_the_root_package(tmp_path, monkeypatch):
+    """E2: a package whose __path__ is a directory ABOVE a root imports the root package as its
+    submodule. The pre-check looked only for parent-path directories under a root."""
+    import types
+
+    tag = uuid.uuid4().hex[:8]
+    parent = tmp_path / f"above_{tag}"
+    root = parent / f"app_{tag}"
+    root.mkdir(parents=True)
+    (root / "__init__.py").write_text("class RootConsumer:\n    def __init__(self):\n        self.clock_instance = None\n")
+    (root / f"clockmod_{tag}.py").write_text("class Clock:\n    pass\n")
+    monkeypatch.syspath_prepend(str(root))
+    monkeypatch.setattr(autowired, "_NAME_MAP_CACHE", autowired._NAME_MAP_CACHE)
+    holder = types.ModuleType(f"holder_{tag}")
+    holder.__path__ = [str(parent)]
+    monkeypatch.setitem(sys.modules, f"holder_{tag}", holder)
+    try:
+        clock = importlib.import_module(f"clockmod_{tag}")
+        container = Container()
+        container.register_singleton(clock.Clock)
+        autowired.auto_inject(container, root_dir=str(root))
+        module = importlib.import_module(f"holder_{tag}.app_{tag}")
+        assert module.RootConsumer().clock_instance is not None, "the root package under a parent path was not patched"
+    finally:
+        for key in [k for k in sys.modules if k.startswith((f"holder_{tag}.", f"clockmod_{tag}", f"app_{tag}"))]:
+            sys.modules.pop(key, None)
+
+
+def test_a_root_added_later_is_seen_by_the_pre_check(tmp_path, monkeypatch):
+    """Where a finder's directory lies is remembered per set of roots: a root added later (a second
+    auto_inject) must not meet the answer worked out before it."""
+    first = tmp_path / "first_root"
+    first.mkdir()
+    later = tmp_path / "later_root"
+    later.mkdir()
+    (later / "latermod.py").write_text("")
+    monkeypatch.setattr(autowired, "_LATE_ROOTS", [])
+    autowired._remember_late_root(first)
+    monkeypatch.setattr(sys, "path", [str(later)] + sys.path)
+    importlib.invalidate_caches()
+    assert importlib.machinery.PathFinder.find_spec("latermod", [str(later)]) is not None  # its finder exists
+    assert not autowired._maybe_project_name("latermod", None)
+    autowired._remember_late_root(later)
+    assert autowired._maybe_project_name("latermod", None), "a root added later was not seen"

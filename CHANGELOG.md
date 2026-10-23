@@ -149,13 +149,22 @@ changes" says so.
   the module Python asked them all again: every failing import (an optional
   dependency tried at run time, often once per request) scanned the whole
   `sys.path` twice - about +0.5 ms per request in a real application. The hook
-  now first checks whether the name can be a project module at all: its
-  top-level name is a root's own name, Python's own path search finds it in a
-  `sys.path` entry under a root (sharing Python's directory caches - no cache
-  of the library's can say "not there" for a file just created), or a
-  non-standard finder (an editable install's name map) finds it. Anything
-  else is left to Python at once. What remains is one look into each
-  `sys.path` entry under a root per failing import.
+  now first checks whether Python's search can end in a file under a project
+  root at all. Each entry of the list Python searches (`sys.path`, or the
+  parent package's path) is judged by the finder Python itself keeps for it -
+  whose directory is fixed when Python makes it (a `"."` entry keeps the
+  working directory of that moment): a directory under a root is asked through
+  that very finder and its cache (no cache of the library's can say "not
+  there" for a file just created), a directory above a root holds only the
+  root package's own name, any other directory cannot hold a project file, and
+  an entry with no finder yet or another kind of finder gets Python's own
+  search. A non-standard meta-path finder (an editable install's name map) is
+  asked as before. Anything else is left to Python at once. What remains is one
+  look into each directory under a root per failing import. New known limit:
+  if the module's file is created during its own import, or another thread
+  changes `sys.path` or `sys.path_importer_cache` meanwhile, the check and
+  Python's search may disagree and the module loads unpatched (fields `None`,
+  no message) - see "Known limits".
 
 ### Root fixes
 

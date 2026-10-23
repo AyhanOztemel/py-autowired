@@ -672,6 +672,16 @@ What 0.5.4 does not promise, in one place:
   that thread released the lock.
 - **Class metadata changed after registration** (e.g. a registered class's
   `__name__`) is not seen by the name map on its own - call `refresh()`.
+- **A late import racing a change of the import system:** a module imported
+  for the first time after `auto_inject()` is patched only if the late-import
+  hook's quick check and Python's own search see the same thing. They may not
+  in two cases: the module's file is created during those microseconds of its
+  own import, or another thread changes `sys.path` or
+  `sys.path_importer_cache` while the import runs. Then the module loads
+  unpatched and its `*_instance` fields stay `None`, with no message. Python
+  itself does not treat either case as safe; avoid them by writing project
+  files before importing them and changing `sys.path` before starting threads
+  that import.
 - *(Resolved in 0.5.4)* Two limits of earlier changelogs no longer hold:
   `replace()` moves the aliases of the replaced type along, and fields assigned
   in an inherited `__init__` without annotation are injected.
