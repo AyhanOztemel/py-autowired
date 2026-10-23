@@ -1480,10 +1480,11 @@ def _place(directory: str, roots: tuple) -> tuple:
     return known
 
 
-def _entry_may_hold(entry: str, fullname: str, head: str, roots: tuple) -> bool:
+def _entry_may_hold(entry: str, fullname: str, head: str, roots: tuple, target) -> bool:
     """Can Python's search of this one path entry give ``fullname`` a file under a root? Judged by the
     finder Python itself keeps for the entry - its directory is fixed when Python makes it (a "."
-    entry keeps the working directory of that moment) - never by the entry's spelling."""
+    entry keeps the working directory of that moment) - never by the entry's spelling. Asked with the
+    same ``target`` Python passes (reload), as a finder may answer only with it."""
     key = entry
     if entry == "":  # as Python's own search: "" is the working directory at each import
         try:
@@ -1499,9 +1500,9 @@ def _entry_may_hold(entry: str, fullname: str, head: str, roots: tuple) -> bool:
             return False  # every file it finds is <its directory>/<name>...: never under a root
         if place is _ABOVE:
             return head in heads
-        return finder.find_spec(fullname) is not None  # the very finder and cache Python asks next
+        return finder.find_spec(fullname, target) is not None  # the very finder and cache Python asks next
     # Not made yet, or another kind (a zip, a custom path hook): Python's own search of the entry.
-    return importlib.machinery.PathFinder.find_spec(fullname, [entry]) is not None
+    return importlib.machinery.PathFinder.find_spec(fullname, [entry], target) is not None
 
 
 def _maybe_project_name(fullname: str, path, target=None) -> bool:
@@ -1513,7 +1514,7 @@ def _maybe_project_name(fullname: str, path, target=None) -> bool:
     roots = tuple(_LATE_ROOTS)
     try:
         for entry in list(sys.path if path is None else path):
-            if isinstance(entry, str) and _entry_may_hold(entry, fullname, head, roots):
+            if isinstance(entry, str) and _entry_may_hold(entry, fullname, head, roots, target):
                 return True
         # Any other finder (an editable install's name map, ...) may lead into a root without a
         # path entry: asked as before - usually a dictionary look-up, not a path scan.

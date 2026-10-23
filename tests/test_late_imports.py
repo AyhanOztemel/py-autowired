@@ -415,3 +415,46 @@ def test_a_root_added_later_is_seen_by_the_pre_check(tmp_path, monkeypatch):
     assert not autowired._maybe_project_name("latermod", None)
     autowired._remember_late_root(later)
     assert autowired._maybe_project_name("latermod", None), "a root added later was not seen"
+
+
+def test_a_reload_found_only_with_its_target_is_still_patched(project, monkeypatch):
+    """reload() passes the module being reloaded (``target``) to the finders, and a path finder may
+    find a module only then. The pre-check searched each entry without the target, ruled the
+    name out, and Python then reloaded the module from the root - unpatched (targeted check 23)."""
+    import importlib.util
+
+    root, tag, names = project
+    _start(root, tag)
+    hidden = root / f"hidden_{tag}"
+    hidden.mkdir()
+    name = f"tgt_{tag}"
+    source = hidden / f"{name}.py"
+    source.write_text("class Reloaded:\n    def __init__(self):\n        self.clock_instance = None\n")
+    entry = f"target-only::{tag}"
+
+    class TargetOnly:
+        def find_spec(self, fullname, target=None):
+            if fullname != name or target is None:
+                return None
+            return importlib.util.spec_from_file_location(fullname, str(source))
+
+        def invalidate_caches(self):
+            pass
+
+    def hook(path):
+        if path != entry:
+            raise ImportError(path)
+        return TargetOnly()
+
+    monkeypatch.setattr(sys, "path_hooks", [hook] + sys.path_hooks)
+    monkeypatch.setattr(sys, "path_importer_cache", dict(sys.path_importer_cache))
+    monkeypatch.setattr(sys, "path", sys.path + [entry])
+    spec = importlib.util.spec_from_file_location(name, str(source))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+        module = importlib.reload(module)
+        assert module.Reloaded().clock_instance is not None, "a module reloaded through its target was not patched"
+    finally:
+        sys.modules.pop(name, None)
