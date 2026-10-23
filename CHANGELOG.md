@@ -145,6 +145,17 @@ changes" says so.
   drain of the queue (a later import, `refresh()`, `activate_container()` or
   `auto_inject()`) - which might never come. It is now patched as soon as the
   lock is free.
+- The late-import hook asked every other finder itself, and when none found
+  the module Python asked them all again: every failing import (an optional
+  dependency tried at run time, often once per request) scanned the whole
+  `sys.path` twice - about +0.5 ms per request in a real application. The hook
+  now first checks whether the name can be a project module at all: its
+  top-level name is a root's own name, Python's own path search finds it in a
+  `sys.path` entry under a root (sharing Python's directory caches - no cache
+  of the library's can say "not there" for a file just created), or a
+  non-standard finder (an editable install's name map) finds it. Anything
+  else is left to Python at once. What remains is one look into each
+  `sys.path` entry under a root per failing import.
 
 ### Root fixes
 

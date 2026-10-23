@@ -1444,11 +1444,97 @@ class _LateImportLoader(importlib.machinery.SourceFileLoader):
         _patch_late_module(module)
 
 
+def _under_a_root(directory: str) -> bool:
+    candidate = os.path.normcase(os.path.abspath(directory or ".")) + os.sep
+    return any(candidate.startswith(root) for root in _LATE_ROOTS)
+
+
+def _root_heads(directory: str) -> frozenset:
+    """For a directory ABOVE a root: the root's first part below it - the top-level name under
+    which the root itself (a package directory) is imported from that sys.path entry."""
+    prefix = os.path.normcase(os.path.abspath(directory or ".")).rstrip(os.sep) + os.sep
+    return frozenset(root[len(prefix):].split(os.sep, 1)[0] for root in _LATE_ROOTS
+                     if root.startswith(prefix) and len(root) > len(prefix))
+
+
+def _maybe_project_name(fullname: str, path) -> bool:
+    """False only when ``fullname`` cannot be a module under a project root: its top-level name is
+    not a root's own name seen from a sys.path entry above it, Python's own path search finds it in
+    no sys.path entry under a root, and (for a submodule) no directory of its parent's path is under
+    a root. Python's search shares Python's own directory caches, so it answers exactly as the
+    import that follows will (no cache of ours can say "not there"); for a missing name it costs one
+    stat per entry under a root, not a scan of all of sys.path. Every doubt goes the full way."""
+    if path is not None:
+        for directory in list(path):
+            if isinstance(directory, str) and _under_a_root(directory):
+                return True
+    top = fullname.partition(".")[0]
+    _seen, under, heads, relative = _root_entries()
+    folded = os.path.normcase(top)
+    if folded in heads:
+        return True
+    entries = list(under)
+    for entry in relative:  # "" or a relative path: the current directory decides, every time
+        if folded in _root_heads(entry):
+            return True
+        if _under_a_root(entry):
+            entries.append(entry)
+    try:
+        if entries and importlib.machinery.PathFinder.find_spec(top, entries) is not None:
+            return True
+        # Any other finder (an editable install's name map, ...) may lead into a root without a
+        # sys.path entry: asked as before - usually a dictionary look-up, not a path scan.
+        for finder in list(sys.meta_path):
+            if type(finder) is _LateImportFinder or finder in _STANDARD_FINDERS:
+                continue
+            find_spec = getattr(finder, "find_spec", None)
+            if find_spec is not None and find_spec(fullname, path, None) is not None:
+                return True
+    except Exception:  # a broken hook: not ours to judge
+        return True
+    return False
+
+
+_STANDARD_FINDERS = (importlib.machinery.BuiltinImporter, importlib.machinery.FrozenImporter,
+                     importlib.machinery.PathFinder)
+
+
+# (sys.path and roots seen, entries under a root, root names seen from entries above a root,
+# relative entries). ONE immutable tuple, replaced by one assignment: a reader never mixes two
+# states (free-threaded build). Relative entries are never resolved here (the current directory may
+# change without sys.path changing). Entries keep their sys.path spelling, so Python's search uses
+# the very finders - and directory caches - the import itself uses.
+_ROOT_ENTRIES: tuple = ((), (), frozenset(), ())
+
+
+def _root_entries() -> tuple:
+    global _ROOT_ENTRIES
+    key = (tuple(sys.path), tuple(_LATE_ROOTS))
+    state = _ROOT_ENTRIES
+    if state[0] == key:
+        return state
+    under, heads, relative = [], set(), []
+    for entry in key[0]:
+        if not isinstance(entry, str):  # as Python's own path search
+            continue
+        if not entry or not os.path.isabs(entry):
+            relative.append(entry)
+            continue
+        if _under_a_root(entry):
+            under.append(entry)
+        heads |= _root_heads(entry)
+    state = (key, tuple(under), frozenset(heads), tuple(relative))
+    _ROOT_ENTRIES = state
+    return state
+
+
 class _LateImportFinder(importlib.abc.MetaPathFinder):
-    """Asks the other finders and marks project source modules for patching."""
+    """Asks the other finders and marks project source modules for patching. A name that cannot
+    be a project module is left to them at once - asking them here too searched every failing
+    import twice (0.5.4: one optional import per request cost about 0.5 ms)."""
 
     def find_spec(self, fullname, path, target=None):
-        if not _LATE_ROOTS:
+        if not _LATE_ROOTS or not _maybe_project_name(fullname, path):
             return None
         for finder in sys.meta_path:
             if finder is self:
