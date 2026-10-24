@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.4 - 2026-10-21
+## 0.5.4 - 2026-10-24
 
 No problem stays silently behind a `try/except`, a DEBUG-only line or a quiet
 default any more: each one is a WARNING, an ERROR or a validation issue - shown
