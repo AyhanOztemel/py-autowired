@@ -1103,8 +1103,12 @@ def _load_project_modules(root: Path, exclude_dirs: Optional[Iterable[str]] = No
     # Get current script's path for exclusion
     current_script = Path(__file__).resolve()
 
-    # Optimized: use Path.rglob
-    py_files = list(root.rglob("*.py"))
+    # One order on every system: the listing comes in the file system's order (ext4: hash order,
+    # NTFS: roughly by name), and the order decides which file loads which - the same project then
+    # met other checks and messages on another system. Sorted by the path's parts compared as text
+    # (every path starts with the root's parts) - not Path order: Windows compares paths ignoring
+    # case, POSIX does not.
+    py_files = sorted(root.rglob("*.py"), key=lambda path: path.parts)
     loaded = 0
     total_files = 0
     skipped = []

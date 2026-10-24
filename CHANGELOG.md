@@ -145,6 +145,14 @@ changes" says so.
   drain of the queue (a later import, `refresh()`, `activate_container()` or
   `auto_inject()`) - which might never come. It is now patched as soon as the
   lock is free.
+- Discovery went through the project's files in the order the file system
+  listed them (ext4: hash order, NTFS: roughly by name). The order decides
+  which file loads which, so the same project could meet other checks and
+  messages on another system - for example a file skipped while the
+  application module was still importing was checked (an ERROR) on one system
+  and loaded without that check on another. Discovery now sorts the files by
+  their path parts compared as plain text: one order on every system (not
+  Python's path order, which ignores case on Windows only).
 - The late-import hook asked every other finder itself, and when none found
   the module Python asked them all again: every failing import (an optional
   dependency tried at run time, often once per request) scanned the whole

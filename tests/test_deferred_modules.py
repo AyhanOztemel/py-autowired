@@ -820,3 +820,53 @@ def test_validate_autowiring_checks_a_loaded_skipped_file_the_automatic_path_mis
     error = _call(autowired.validate_autowiring, app.container)
     assert isinstance(error, AutowiringValidationError)
     assert f"main_{tag}.Consumer.missing_thing_instance: no matching registration" in error.issues
+
+
+# ---- 0.5.4 CI (Linux): discovery order must not follow the file system ----
+
+def _listing_in(monkeypatch, order):
+    """Path.rglob as another file system would list it: ``order`` gets the sorted list."""
+    import pathlib
+
+    original = pathlib.Path.rglob
+    monkeypatch.setattr(pathlib.Path, "rglob",
+                        lambda self, pattern, *a, **k: iter(order(sorted(original(self, pattern, *a, **k)))))
+
+
+def test_nested_discovery_is_the_same_whatever_the_file_system_lists_first(make_project, caplog, monkeypatch):
+    """ext4 lists a directory in hash order, NTFS roughly by name: discovery used the listing as it
+    came, so the same project had main loaded by the outer discovery (no check, no ERROR) on one
+    system and checked when it loaded (an ERROR) on another - the CI run on Linux failed where
+    Windows passed. Discovery now goes through the files in one order on every system."""
+    _listing_in(monkeypatch, lambda paths: paths[::-1])  # main_ before app_
+    root, tag = make_project(MISSING)
+    from py_autowired import Container
+    with caplog.at_level(logging.DEBUG, logger="py_autowired"):
+        autowired.auto_inject(Container(), root_dir=str(root))
+    assert f"main_{tag}" in sys.modules
+    assert len(_records(caplog, logging.ERROR, f"main_{tag}", "no matching registration")) == 1
+
+
+def test_discovery_order_is_the_text_order_of_the_path_on_every_system(tmp_path, monkeypatch):
+    """Not the system's own path order either: Windows compares paths ignoring case, POSIX does
+    not - one order on both means comparing the path below the root as plain text."""
+    import builtins
+
+    tag = uuid.uuid4().hex[:8]
+    root = tmp_path / f"order_{tag}"
+    (root / "sub").mkdir(parents=True)
+    (root / "requirements.txt").write_text("")
+    seen = f"_py_autowired_order_{tag}"
+    monkeypatch.setattr(builtins, seen, [], raising=False)
+    names = [f"B_mod_{tag}", f"a_mod_{tag}", f"sub/c_mod_{tag}"]
+    for name in names:
+        (root / f"{name}.py").write_text(f"import builtins\nbuiltins.{seen}.append(__name__)\n")
+    _listing_in(monkeypatch, lambda paths: sorted(paths, key=lambda p: str(p).lower()))  # Windows-like
+    from py_autowired import Container
+    try:
+        autowired.auto_inject(Container(), root_dir=str(root))
+        loaded = [name.rpartition(".")[2] for name in getattr(builtins, seen)]
+        assert loaded == [f"B_mod_{tag}", f"a_mod_{tag}", f"c_mod_{tag}"], loaded
+    finally:
+        for key in [k for k in sys.modules if tag in k]:
+            sys.modules.pop(key, None)
